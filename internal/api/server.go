@@ -12,6 +12,10 @@ func NewRouter() *http.ServeMux {
 
 	mux.HandleFunc("POST /v1/createroom", createroom)
 	mux.HandleFunc("GET /v1/listrooms", listrooms)
+	mux.HandleFunc("POST /v1/rooms/{id}/join", join_room)
+	mux.HandleFunc("POST /v1/rooms/{id}/leave", leave_room)
 
+	mux.HandleFunc("GET /v1/rooms/{id}/messages", get_messages)
+	mux.HandleFunc("GET /v1/rooms/{id}/ws", get_soc) // Socket Connection for realtime update
 	return mux
 }
