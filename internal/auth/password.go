@@ -11,13 +11,13 @@ func hash(password string) string {
 	ps := []byte(password)
 	gen_hash, err := bcrypt.GenerateFromPassword(ps, c)
 	if err != nil {
-		log.Fatal(err)
+		return ""
 	}
 	return string(gen_hash)
 
 }
 
 func comp_hash(password string, hash string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(password), []byte(hash))
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 	return err == nil
 }
