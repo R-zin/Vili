@@ -3,11 +3,12 @@
 .env.local
 *.env
 
-# Build artifacts
+# Build artifacts (binaries only; do not ignore the cmd/vili source tree)
 /bin/
 /dist/
 *.exe
-vili
+/vili
+/vili.exe
 
 # Test / coverage output
 coverage.out
