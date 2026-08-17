@@ -17,13 +17,20 @@ import (
 	"github.com/R-zin/vili/internal/config"
 )
 
-// Run starts the HTTP server on cfg.Port and serves handler until an
-// interrupt/SIGTERM arrives, then shuts down gracefully within
-// cfg.HTTP.ShutdownTimeout. It returns nil on a clean shutdown and a non-nil
-// error if ListenAndServe fails for any reason other than http.ErrServerClosed.
+// Run binds cfg.Port, serves handler, and blocks until an interrupt/SIGTERM
+// arrives or the parent context is cancelled, then shuts down gracefully
+// within cfg.HTTP.ShutdownTimeout. It returns nil on a clean shutdown and a
+// non-nil error if binding or serving fails for any reason other than
+// http.ErrServerClosed. Binding happens synchronously so an unusable address
+// fails fast instead of racing the shutdown path.
 func Run(ctx context.Context, cfg config.Config, handler http.Handler) error {
+	addr := net.JoinHostPort("", strconv.Itoa(cfg.Port))
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("server: listen %s: %w", addr, err)
+	}
+
 	srv := &http.Server{
-		Addr:              net.JoinHostPort("", strconv.Itoa(cfg.Port)),
 		Handler:           handler,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
@@ -37,17 +44,17 @@ func Run(ctx context.Context, cfg config.Config, handler http.Handler) error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		slog.Info("http server listening", "addr", srv.Addr)
-		serveErr <- srv.ListenAndServe()
+		slog.Info("http server listening", "addr", listener.Addr().String())
+		serveErr <- srv.Serve(listener)
 	}()
 
 	select {
 	case <-ctx.Done():
 		slog.Info("shutdown signal received, draining connections")
 	case err := <-serveErr:
-		// Server stopped on its own before any signal.
+		// Serve returned before any shutdown signal.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("server: listen: %w", err)
+			return fmt.Errorf("server: serve: %w", err)
 		}
 		return nil
 	}
@@ -58,9 +65,9 @@ func Run(ctx context.Context, cfg config.Config, handler http.Handler) error {
 		return fmt.Errorf("server: shutdown: %w", err)
 	}
 
-	// Wait for ListenAndServe to return after shutdown.
+	// Wait for Serve to return after shutdown.
 	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("server: listen: %w", err)
+		return fmt.Errorf("server: serve: %w", err)
 	}
 	slog.Info("http server stopped cleanly")
 	return nil
