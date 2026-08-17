@@ -1,15 +1,20 @@
 # Environment / secrets — never commit real credentials
 .env
+.env.local
 *.env
 !.env.example
 
-# Build artifacts
-bin/
+# Build artifacts (binaries only; do not ignore the cmd/vili source tree)
+/bin/
+/dist/
 *.exe
-*.out
+/vili
+/vili.exe
 
-# Test / coverage
+# Test / coverage output
 coverage.out
+*.coverprofile
+*.out
 *.test
 
 # AgentHub coordination state (session metadata, message board)
@@ -18,5 +23,7 @@ coverage.out
 # Claude Code session worktrees
 .claude/
 
-# Editor
+# Editor / OS noise
 .idea/
+.vscode/
+.DS_Store

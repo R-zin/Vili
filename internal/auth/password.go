@@ -1,23 +1,26 @@
 package auth
 
 import (
-	"log"
+	"fmt"
 
 	"golang.org/x/crypto/bcrypt"
 )
 
-func hash(password string) string {
-	c := bcrypt.DefaultCost
-	ps := []byte(password)
-	gen_hash, err := bcrypt.GenerateFromPassword(ps, c)
+// HashPassword hashes a plaintext password with bcrypt at the default cost.
+// Errors are returned, never swallowed.
+func HashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("auth: hash password: %w", err)
 	}
-	return string(gen_hash)
-
+	return string(hash), nil
 }
 
-func comp_hash(password string, hash string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	return err == nil
+// CompareHashAndPassword reports whether password matches the bcrypt hash.
+// It returns nil on match and a non-nil error on mismatch or malformed hash.
+func CompareHashAndPassword(hash, password string) error {
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
+		return fmt.Errorf("auth: compare password: %w", err)
+	}
+	return nil
 }
