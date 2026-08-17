@@ -1,0 +1,19 @@
+# Environment / secrets — never commit real credentials
+.env
+*.env
+!.env.example
+
+# Build artifacts
+bin/
+*.exe
+*.out
+
+# Test / coverage
+coverage.out
+*.test
+
+# AgentHub coordination state (session metadata, message board)
+.agenthub/
+
+# Editor
+.idea/
