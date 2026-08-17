@@ -15,5 +15,8 @@ coverage.out
 # AgentHub coordination state (session metadata, message board)
 .agenthub/
 
+# Claude Code session worktrees
+.claude/
+
 # Editor
 .idea/
