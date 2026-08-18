@@ -25,10 +25,12 @@ auth, users, rooms, membership, and messages; the CLI stays a thin, opinionated 
 
 ## Status
 
-**Phase 1 — backend foundation: complete and green.** The HTTP API, authentication, room
-and message persistence, migrations, and a full no-DB unit-test suite are done. The
-terminal **CLI (`vili`) is a Phase-2 placeholder** and not yet functional (see
-[Roadmap](#roadmap)).
+**Phases 1–3: backend foundation + CLI, complete and green.** The HTTP API,
+authentication, room and message persistence, migrations, and a full no-DB unit-test
+suite are done. **Message history and posting are membership-gated.** The `vili`
+terminal CLI (Phase 3) now ships: register/login with a saved session, room browsing,
+message send, and a poll-based interactive chat view (see [Quickstart (CLI)](#quickstart-cli)).
+Real-time WebSocket delivery is Phase 4 (see [Roadmap](#roadmap)).
 
 ## Features
 
@@ -45,9 +47,10 @@ layer holds no business logic.
 ```
 cmd/
   server/      the backend HTTP API (only server entrypoint)
-  vili/        the CLI client (Phase 2+ — currently a build stub)
+  vili/        the terminal CLI client (thin wrapper over internal/cli)
 internal/
   api/         thin wiring: composes feature routes onto one ServeMux + auth middleware
+  cli/         CLI client: HTTP consumer, session persistence, subcommands, chat view
   user/        accounts: types, Postgres repo, register/login handlers
   room/        rooms & membership: types, repo, handlers
   message/     messages: types, repo, membership-gated list handler
@@ -92,7 +95,32 @@ curl -s -X POST localhost:8080/v1/auth/login \
 # call a protected route
 TOKEN=...   # from login
 curl -s localhost:8080/v1/listrooms -H "Authorization: Bearer $TOKEN"
+
+# post a message (members only)
+curl -s -X POST localhost:8080/v1/rooms/$ROOM_ID/messages \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"content":"hello","type":"text"}'
 ```
+
+## Quickstart (CLI)
+
+The `vili` terminal client talks to the backend over the same API. Build it, point it
+at a running server, and sign in (the session is saved to `~/.config/vili/session.json`).
+
+```bash
+go build -o vili ./cmd/vili
+
+./vili register dev supersecret
+./vili login dev supersecret        # saves token + user to the session
+./vili create general "watercooler"
+./vili rooms                        # note a room id
+./vili join <room-id>               # (a creator is already a member)
+./vili send <room-id> hello world
+./vili history <room-id>
+./vili chat <room-id>               # watch + type interactively; /quit to exit
+```
+
+`--server URL` selects a backend (default `http://localhost:8080`; saved on login).
 
 ## API
 
@@ -110,6 +138,7 @@ All endpoints are versioned under `/v1`. Protected routes require
 | POST | `/v1/rooms/{id}/join` | ✔ | Join a room (member role) → `200` |
 | POST | `/v1/rooms/{id}/leave` | ✔ | Leave a room → `200` |
 | GET | `/v1/rooms/{id}/messages` | ✔ | Room history (`?limit=` 1–100, `?before=` RFC3339) → `200`. **Members only.** |
+| POST | `/v1/rooms/{id}/messages` | ✔ | Post a message `{content, type?}` → `201`. **Members only.** |
 
 Errors share one envelope; success responses are plain resource JSON:
 
@@ -171,7 +200,7 @@ Current green gate for CI: `go build ./...`, `go vet ./...`, `gofmt -l .` empty,
 
 - [x] **Phase 1** — project structure, config, DB connect + migrations, register/login, health/readiness
 - [x] **Phase 2 (backend side)** — rooms, membership, message persistence + message APIs
-- [ ] **Phase 3** — CLI client: login/session persistence, room browsing, interactive chat UI
+- [x] **Phase 3** — CLI client: login/session persistence, room browsing, message send, interactive chat view (poll-based)
 - [ ] **Phase 4** — real-time messaging (WebSocket), presence, typing indicators
 - [ ] **Phase 5** — production hardening, observability, rate limiting, deployment, **Homebrew distribution**
 

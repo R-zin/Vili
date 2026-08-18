@@ -114,3 +114,17 @@ func (r *PostgresRepository) ListByRoom(ctx context.Context, roomID uuid.UUID, l
 	}
 	return messages, nil
 }
+
+// IsMember reports whether userID rows exist in room_members for roomID. The
+// package is self-contained, so membership is checked here directly rather
+// than by importing the room feature.
+func (r *PostgresRepository) IsMember(ctx context.Context, roomID, userID uuid.UUID) (bool, error) {
+	var member bool
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2)`,
+		roomID, userID,
+	).Scan(&member); err != nil {
+		return false, fmt.Errorf("message: is member: %w", err)
+	}
+	return member, nil
+}

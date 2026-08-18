@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,9 +17,11 @@ import (
 
 // fakeRepo is an in-memory Repository implementation for tests.
 type fakeRepo struct {
-	messages map[uuid.UUID][]Message
-	rooms    map[uuid.UUID]bool
-	listErr  error
+	messages  map[uuid.UUID][]Message
+	rooms     map[uuid.UUID]bool
+	members   map[uuid.UUID]map[uuid.UUID]bool // roomID -> userID -> member
+	listErr   error
+	createErr error
 
 	gotLimit  int
 	gotBefore *time.Time
@@ -28,10 +31,22 @@ func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
 		messages: make(map[uuid.UUID][]Message),
 		rooms:    make(map[uuid.UUID]bool),
+		members:  make(map[uuid.UUID]map[uuid.UUID]bool),
 	}
 }
 
+// addMember registers userID as a member of roomID in the fake.
+func (f *fakeRepo) addMember(roomID, userID uuid.UUID) {
+	if f.members[roomID] == nil {
+		f.members[roomID] = make(map[uuid.UUID]bool)
+	}
+	f.members[roomID][userID] = true
+}
+
 func (f *fakeRepo) Create(ctx context.Context, msg *Message) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
 	if !f.rooms[msg.RoomID] {
 		return ErrRoomNotFound
 	}
@@ -40,6 +55,9 @@ func (f *fakeRepo) Create(ctx context.Context, msg *Message) error {
 	}
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = time.Now()
+	}
+	if msg.Type == "" {
+		msg.Type = TypeText
 	}
 	f.messages[msg.RoomID] = append(f.messages[msg.RoomID], *msg)
 	return nil
@@ -55,6 +73,10 @@ func (f *fakeRepo) ListByRoom(ctx context.Context, roomID uuid.UUID, limit int, 
 	f.gotLimit = limit
 	f.gotBefore = before
 	return f.messages[roomID], nil
+}
+
+func (f *fakeRepo) IsMember(ctx context.Context, roomID, userID uuid.UUID) (bool, error) {
+	return f.members[roomID][userID], nil
 }
 
 var testTokenService = mustTokenService()
@@ -89,10 +111,12 @@ func TestList_OK(t *testing.T) {
 		}
 	}
 
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
 	h := NewHandler(repo)
 	req := httptest.NewRequest(http.MethodGet, "/v1/rooms/"+roomID.String()+"/messages", nil)
 	req.SetPathValue("id", roomID.String())
-	rec := authed(t, uuid.New(), h.list, req)
+	rec := authed(t, userID, h.list, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
@@ -137,10 +161,12 @@ func TestList_BadLimit(t *testing.T) {
 	repo := newFakeRepo()
 	roomID := uuid.New()
 	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
 	h := NewHandler(repo)
 	req := httptest.NewRequest(http.MethodGet, "/?limit=abc", nil)
 	req.SetPathValue("id", roomID.String())
-	rec := authed(t, uuid.New(), h.list, req)
+	rec := authed(t, userID, h.list, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for non-integer limit, got %d", rec.Code)
 	}
@@ -150,10 +176,12 @@ func TestList_BadBeforeCursor(t *testing.T) {
 	repo := newFakeRepo()
 	roomID := uuid.New()
 	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
 	h := NewHandler(repo)
 	req := httptest.NewRequest(http.MethodGet, "/?before=not-a-time", nil)
 	req.SetPathValue("id", roomID.String())
-	rec := authed(t, uuid.New(), h.list, req)
+	rec := authed(t, userID, h.list, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for bad before cursor, got %d", rec.Code)
 	}
@@ -163,11 +191,13 @@ func TestList_BeforeCursorPassed(t *testing.T) {
 	repo := newFakeRepo()
 	roomID := uuid.New()
 	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
 	h := NewHandler(repo)
 	cursor := time.Now().UTC().Truncate(time.Second)
 	req := httptest.NewRequest(http.MethodGet, "/?limit=5&before="+cursor.Format(time.RFC3339), nil)
 	req.SetPathValue("id", roomID.String())
-	rec := authed(t, uuid.New(), h.list, req)
+	rec := authed(t, userID, h.list, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
@@ -183,11 +213,149 @@ func TestList_StoreError(t *testing.T) {
 	repo := newFakeRepo()
 	roomID := uuid.New()
 	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
 	repo.listErr = errors.New("query failed")
 	h := NewHandler(repo)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.SetPathValue("id", roomID.String())
+	rec := authed(t, userID, h.list, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+}
+
+// TestList_NotMember asserts history is members-only: an authenticated user
+// who is not a member of an existing room gets the same 404 as an unknown room.
+func TestList_NotMember(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true // room exists, but the caller is not a member
+	h := NewHandler(repo)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetPathValue("id", roomID.String())
 	rec := authed(t, uuid.New(), h.list, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for non-member, got %d", rec.Code)
+	}
+}
+
+func TestCreate_OK(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
+
+	h := NewHandler(repo)
+	body := strings.NewReader(`{"content":"hello world"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/rooms/"+roomID.String()+"/messages", body)
+	req.SetPathValue("id", roomID.String())
+	rec := authed(t, userID, h.create, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var got Message
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Content != "hello world" {
+		t.Fatalf("expected content persisted, got %+v", got)
+	}
+	if got.Type != TypeText {
+		t.Fatalf("expected default type text, got %q", got.Type)
+	}
+	if got.UserID != userID {
+		t.Fatalf("expected author %s, got %s", userID, got.UserID)
+	}
+}
+
+func TestCreate_NotMember(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true // exists, caller not a member
+	h := NewHandler(repo)
+	body := strings.NewReader(`{"content":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req.SetPathValue("id", roomID.String())
+	rec := authed(t, uuid.New(), h.create, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for non-member, got %d", rec.Code)
+	}
+}
+
+func TestCreate_BadUUID(t *testing.T) {
+	h := NewHandler(newFakeRepo())
+	body := strings.NewReader(`{"content":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req.SetPathValue("id", "nope")
+	rec := authed(t, uuid.New(), h.create, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCreate_MalformedJSON(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
+	h := NewHandler(repo)
+	body := strings.NewReader(`{"content":`)
+	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req.SetPathValue("id", roomID.String())
+	rec := authed(t, userID, h.create, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed JSON, got %d", rec.Code)
+	}
+}
+
+func TestCreate_EmptyContent(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
+	h := NewHandler(repo)
+	body := strings.NewReader(`{"content":""}`)
+	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req.SetPathValue("id", roomID.String())
+	rec := authed(t, userID, h.create, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty content, got %d", rec.Code)
+	}
+}
+
+func TestCreate_BadType(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
+	h := NewHandler(repo)
+	body := strings.NewReader(`{"content":"hi","type":"gif"}`)
+	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req.SetPathValue("id", roomID.String())
+	rec := authed(t, userID, h.create, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad type, got %d", rec.Code)
+	}
+}
+
+func TestCreate_StoreError(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
+	repo.createErr = errors.New("insert failed")
+	h := NewHandler(repo)
+	body := strings.NewReader(`{"content":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req.SetPathValue("id", roomID.String())
+	rec := authed(t, userID, h.create, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", rec.Code)
 	}

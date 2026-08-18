@@ -38,7 +38,10 @@ type Message struct {
 }
 
 // Sentinel errors mapped to HTTP responses by the handler.
-var ErrRoomNotFound = errors.New("room not found")
+var (
+	ErrRoomNotFound = errors.New("room not found")
+	ErrNotMember    = errors.New("user is not a member")
+)
 
 // Repository is the narrow persistence interface the Handler depends on. It
 // is satisfied by PostgresRepository in production and in-memory fakes in
@@ -51,4 +54,7 @@ type Repository interface {
 	// those created before the cursor, oldest-first. An unknown room maps to
 	// ErrRoomNotFound.
 	ListByRoom(ctx context.Context, roomID uuid.UUID, limit int, before *time.Time) ([]Message, error)
+	// IsMember reports whether userID belongs to the room identified by
+	// roomID. The handler uses it to gate reading history and posting.
+	IsMember(ctx context.Context, roomID, userID uuid.UUID) (bool, error)
 }
