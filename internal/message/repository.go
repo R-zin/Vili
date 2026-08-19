@@ -25,8 +25,9 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 }
 
 // Create inserts a message, generating the id and applying type/timestamp
-// defaults, then returns the stored row including the Author username joined
-// from users. A reference to a missing room maps to ErrRoomNotFound.
+// defaults, then returns the stored row including the author username joined
+// from users in the same statement (so a broadcast right after Create carries
+// the author name). A reference to a missing room maps to ErrRoomNotFound.
 func (r *PostgresRepository) Create(ctx context.Context, msg *Message) error {
 	if msg.ID == uuid.Nil {
 		msg.ID = uuid.New()
@@ -39,11 +40,16 @@ func (r *PostgresRepository) Create(ctx context.Context, msg *Message) error {
 	}
 
 	err := r.db.QueryRowContext(ctx, `
-		INSERT INTO messages (id, room_id, user_id, content, type, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING created_at`,
+		WITH ins AS (
+			INSERT INTO messages (id, room_id, user_id, content, type, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			RETURNING user_id, created_at
+		)
+		SELECT i.created_at, u.username
+		FROM ins i
+		JOIN users u ON u.id = i.user_id`,
 		msg.ID, msg.RoomID, msg.UserID, msg.Content, string(msg.Type), msg.CreatedAt,
-	).Scan(&msg.CreatedAt)
+	).Scan(&msg.CreatedAt, &msg.Username)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation {

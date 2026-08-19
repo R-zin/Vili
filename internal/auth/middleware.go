@@ -43,6 +43,23 @@ func (s *TokenService) Require(next http.HandlerFunc) http.Handler {
 	return s.Middleware(next)
 }
 
+// RequireWS is Require plus a fallback to a "token" query parameter. Browser
+// WebSocket clients cannot set an Authorization header on the handshake, so
+// the realtime route authenticates via the header (the CLI) or, when the
+// header is absent, the query token (e.g. the bundled index.html demo). REST
+// routes keep using Require (header only): a query token can leak into
+// logs/caches, so it is accepted only on this realtime route.
+func (s *TokenService) RequireWS(next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			if q := r.URL.Query().Get("token"); q != "" {
+				r.Header.Set("Authorization", "Bearer "+q)
+			}
+		}
+		s.Middleware(next).ServeHTTP(w, r)
+	})
+}
+
 // UserIDFromContext returns the authenticated user id stored by Middleware.
 // The second return value reports whether a user id was present.
 func UserIDFromContext(ctx context.Context) (uuid.UUID, bool) {

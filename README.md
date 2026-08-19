@@ -25,12 +25,13 @@ auth, users, rooms, membership, and messages; the CLI stays a thin, opinionated 
 
 ## Status
 
-**Phases 1–3: backend foundation + CLI, complete and green.** The HTTP API,
+**Phases 1–4: backend + CLI + real-time delivery, complete and green.** The HTTP API,
 authentication, room and message persistence, migrations, and a full no-DB unit-test
 suite are done. **Message history and posting are membership-gated.** The `vili`
-terminal CLI (Phase 3) now ships: register/login with a saved session, room browsing,
-message send, and a poll-based interactive chat view (see [Quickstart (CLI)](#quickstart-cli)).
-Real-time WebSocket delivery is Phase 4 (see [Roadmap](#roadmap)).
+terminal CLI signs in with a saved session, browses rooms, and chats in a **live view**:
+messages, presence, and typing arrive over WebSocket as they happen (no Enter needed),
+with automatic fallback to polling when the socket can't be established.
+See [Quickstart (CLI)](#quickstart-cli) and [Real-time](#real-time).
 
 ## Features
 
@@ -50,11 +51,13 @@ cmd/
   vili/        the terminal CLI client (thin wrapper over internal/cli)
 internal/
   api/         thin wiring: composes feature routes onto one ServeMux + auth middleware
-  cli/         CLI client: HTTP consumer, session persistence, subcommands, chat view
+  cli/         CLI client: HTTP + realtime consumer, session persistence, chat view
   user/        accounts: types, Postgres repo, register/login handlers
   room/        rooms & membership: types, repo, handlers
-  message/     messages: types, repo, membership-gated list handler
-  auth/        bcrypt + JWT (issue/verify) + auth middleware + ctx accessor
+  message/     messages: types, repo, membership-gated handler + post broadcast
+  ws/          realtime: in-memory hub, per-connection pumps, WS upgrade handler
+  event/       realtime wire envelope (tiny leaf shared by message & ws)
+  auth/        bcrypt + JWT (issue/verify) + auth middleware (HTTP + WS) + ctx accessor
   config/      env-only configuration, validated at startup
   store/       pgx/v5 (stdlib) connection + embedded migrations
   respond/     JSON responses + uniform error envelope
@@ -117,10 +120,14 @@ go build -o vili ./cmd/vili
 ./vili join <room-id>               # (a creator is already a member)
 ./vili send <room-id> hello world
 ./vili history <room-id>
-./vili chat <room-id>               # watch + type interactively; /quit to exit
+./vili chat <room-id>               # live view: realtime messages/presence/typing; /quit to exit
 ```
 
 `--server URL` selects a backend (default `http://localhost:8080`; saved on login).
+
+**See it live:** run `./vili chat <room-id>` in two terminals (or open `index.html` in a
+browser as a second peer). A message sent from one appears in the other instantly, along
+with join/leave and typing indicators — no polling.
 
 ## API
 
@@ -138,7 +145,8 @@ All endpoints are versioned under `/v1`. Protected routes require
 | POST | `/v1/rooms/{id}/join` | ✔ | Join a room (member role) → `200` |
 | POST | `/v1/rooms/{id}/leave` | ✔ | Leave a room → `200` |
 | GET | `/v1/rooms/{id}/messages` | ✔ | Room history (`?limit=` 1–100, `?before=` RFC3339) → `200`. **Members only.** |
-| POST | `/v1/rooms/{id}/messages` | ✔ | Post a message `{content, type?}` → `201`. **Members only.** |
+| POST | `/v1/rooms/{id}/messages` | ✔ | Post a message `{content, type?}` → `201`. **Members only.** Broadcast to the room's live connections. |
+| GET | `/v1/rooms/{id}/ws` | ✔ | Real-time WebSocket upgrade (messages, presence, typing). **Members only.** See [Real-time](#real-time). |
 
 Errors share one envelope; success responses are plain resource JSON:
 
@@ -146,8 +154,38 @@ Errors share one envelope; success responses are plain resource JSON:
 { "error": { "code": "invalid_request", "message": "human readable", "status": 400 } }
 ```
 
-> Real-time messaging over WebSocket (`GET /v1/rooms/{id}/ws`) is planned for Phase 4 and
-> is intentionally not registered yet.
+## Real-time
+
+`GET /v1/rooms/{id}/ws` upgrades a room member's connection to a WebSocket (the
+backend requires the same JWT, and enforces membership with the same 404 as REST so
+membership isn't enumerable). Sending stays over REST (`POST …/messages`) so Postgres
+remains the source of truth; the socket is **receive-only** for messages and pushes
+each new message to the room's live connections the moment it's stored.
+
+Because browsers can't set an `Authorization` header on the WebSocket handshake, the
+route also accepts the token as a `?token=` query parameter (header takes precedence);
+the CLI sends the header. This query fallback is enabled **only** on the WS route, never
+on REST.
+
+**Event envelope** (JSON, one per frame):
+
+```json
+{ "type": "message.new|presence.state|presence.join|presence.leave|typing",
+  "room_id": "<uuid>", "payload": { … } }
+```
+
+| Type | Direction | Payload | Meaning |
+|---|---|---|---|
+| `message.new` | server → room | a message object | a member posted; render it |
+| `presence.state` | server → connecting client | `{ "online": ["alice","bob"] }` | who's here now (sent on connect) |
+| `presence.join` / `presence.leave` | server → room | `{ "username": "alice" }` | a member connected / disconnected |
+| `typing` | client → server → room | `{ "username": "alice" }` | ephemeral "typing…" relay (never persisted), throttled |
+
+The `vili chat` view subscribes to this stream: incoming messages render
+immediately (no Enter), presence join/leave and typing show as transient lines. If the
+socket can't be opened it falls back to the original polling loop. Open the bundled
+`index.html` in a browser for a zero-install second client to watch realtime in action
+(paste a JWT from `vili login`, the server URL, and a room id).
 
 ## Configuration
 
@@ -201,13 +239,18 @@ Current green gate for CI: `go build ./...`, `go vet ./...`, `gofmt -l .` empty,
 - [x] **Phase 1** — project structure, config, DB connect + migrations, register/login, health/readiness
 - [x] **Phase 2 (backend side)** — rooms, membership, message persistence + message APIs
 - [x] **Phase 3** — CLI client: login/session persistence, room browsing, message send, interactive chat view (poll-based)
-- [ ] **Phase 4** — real-time messaging (WebSocket), presence, typing indicators
+- [x] **Phase 4** — real-time messaging (WebSocket), presence, typing indicators; live CLI chat view
 - [ ] **Phase 5** — production hardening, observability, rate limiting, deployment, **Homebrew distribution**
 
 ## Built with
 
 Go 1.26 · `net/http` (ServeMux) · `github.com/jackc/pgx/v5` (stdlib `database/sql`) ·
-`github.com/golang-jwt/jwt/v5` · `golang.org/x/crypto/bcrypt` · PostgreSQL.
+`github.com/golang-jwt/jwt/v5` · `golang.org/x/crypto/bcrypt` ·
+`github.com/coder/websocket` (real-time) · PostgreSQL.
+
+> **Dependency note:** the original Phase-1 whitelist excluded a websocket library
+> because real-time was out of scope then. Phase 4 adds `github.com/coder/websocket`
+> (the maintained `nhooyr.io/websocket` successor) — a deliberate, minimal addition.
 
 ---
 

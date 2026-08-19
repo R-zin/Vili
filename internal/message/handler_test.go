@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/R-zin/vili/internal/auth"
+	"github.com/R-zin/vili/internal/event"
 )
 
 // fakeRepo is an in-memory Repository implementation for tests.
@@ -20,6 +21,7 @@ type fakeRepo struct {
 	messages  map[uuid.UUID][]Message
 	rooms     map[uuid.UUID]bool
 	members   map[uuid.UUID]map[uuid.UUID]bool // roomID -> userID -> member
+	usernames map[uuid.UUID]string             // userID -> username (join-at-read)
 	listErr   error
 	createErr error
 
@@ -29,10 +31,20 @@ type fakeRepo struct {
 
 func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
-		messages: make(map[uuid.UUID][]Message),
-		rooms:    make(map[uuid.UUID]bool),
-		members:  make(map[uuid.UUID]map[uuid.UUID]bool),
+		messages:  make(map[uuid.UUID][]Message),
+		rooms:     make(map[uuid.UUID]bool),
+		members:   make(map[uuid.UUID]map[uuid.UUID]bool),
+		usernames: make(map[uuid.UUID]string),
 	}
+}
+
+// fakePublisher captures broadcasts the handler makes after a post.
+type fakePublisher struct {
+	events []event.Event
+}
+
+func (p *fakePublisher) Broadcast(roomID uuid.UUID, e event.Event) {
+	p.events = append(p.events, e)
 }
 
 // addMember registers userID as a member of roomID in the fake.
@@ -58,6 +70,11 @@ func (f *fakeRepo) Create(ctx context.Context, msg *Message) error {
 	}
 	if msg.Type == "" {
 		msg.Type = TypeText
+	}
+	// Mirror the production JOIN: Create fills the author's username from the
+	// usernames map when the caller has not set one.
+	if msg.Username == "" {
+		msg.Username = f.usernames[msg.UserID]
 	}
 	f.messages[msg.RoomID] = append(f.messages[msg.RoomID], *msg)
 	return nil
@@ -113,7 +130,7 @@ func TestList_OK(t *testing.T) {
 
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v1/rooms/"+roomID.String()+"/messages", nil)
 	req.SetPathValue("id", roomID.String())
 	rec := authed(t, userID, h.list, req)
@@ -138,7 +155,7 @@ func TestList_OK(t *testing.T) {
 
 func TestList_RoomNotFound(t *testing.T) {
 	repo := newFakeRepo()
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.SetPathValue("id", uuid.New().String())
 	rec := authed(t, uuid.New(), h.list, req)
@@ -148,7 +165,7 @@ func TestList_RoomNotFound(t *testing.T) {
 }
 
 func TestList_BadUUID(t *testing.T) {
-	h := NewHandler(newFakeRepo())
+	h := NewHandler(newFakeRepo(), nil)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.SetPathValue("id", "nope")
 	rec := authed(t, uuid.New(), h.list, req)
@@ -163,7 +180,7 @@ func TestList_BadLimit(t *testing.T) {
 	repo.rooms[roomID] = true
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	req := httptest.NewRequest(http.MethodGet, "/?limit=abc", nil)
 	req.SetPathValue("id", roomID.String())
 	rec := authed(t, userID, h.list, req)
@@ -178,7 +195,7 @@ func TestList_BadBeforeCursor(t *testing.T) {
 	repo.rooms[roomID] = true
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	req := httptest.NewRequest(http.MethodGet, "/?before=not-a-time", nil)
 	req.SetPathValue("id", roomID.String())
 	rec := authed(t, userID, h.list, req)
@@ -193,7 +210,7 @@ func TestList_BeforeCursorPassed(t *testing.T) {
 	repo.rooms[roomID] = true
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	cursor := time.Now().UTC().Truncate(time.Second)
 	req := httptest.NewRequest(http.MethodGet, "/?limit=5&before="+cursor.Format(time.RFC3339), nil)
 	req.SetPathValue("id", roomID.String())
@@ -216,7 +233,7 @@ func TestList_StoreError(t *testing.T) {
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
 	repo.listErr = errors.New("query failed")
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.SetPathValue("id", roomID.String())
 	rec := authed(t, userID, h.list, req)
@@ -231,7 +248,7 @@ func TestList_NotMember(t *testing.T) {
 	repo := newFakeRepo()
 	roomID := uuid.New()
 	repo.rooms[roomID] = true // room exists, but the caller is not a member
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.SetPathValue("id", roomID.String())
 	rec := authed(t, uuid.New(), h.list, req)
@@ -247,7 +264,7 @@ func TestCreate_OK(t *testing.T) {
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
 
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	body := strings.NewReader(`{"content":"hello world"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/rooms/"+roomID.String()+"/messages", body)
 	req.SetPathValue("id", roomID.String())
@@ -275,7 +292,7 @@ func TestCreate_NotMember(t *testing.T) {
 	repo := newFakeRepo()
 	roomID := uuid.New()
 	repo.rooms[roomID] = true // exists, caller not a member
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	body := strings.NewReader(`{"content":"hi"}`)
 	req := httptest.NewRequest(http.MethodPost, "/", body)
 	req.SetPathValue("id", roomID.String())
@@ -286,7 +303,7 @@ func TestCreate_NotMember(t *testing.T) {
 }
 
 func TestCreate_BadUUID(t *testing.T) {
-	h := NewHandler(newFakeRepo())
+	h := NewHandler(newFakeRepo(), nil)
 	body := strings.NewReader(`{"content":"hi"}`)
 	req := httptest.NewRequest(http.MethodPost, "/", body)
 	req.SetPathValue("id", "nope")
@@ -302,7 +319,7 @@ func TestCreate_MalformedJSON(t *testing.T) {
 	repo.rooms[roomID] = true
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	body := strings.NewReader(`{"content":`)
 	req := httptest.NewRequest(http.MethodPost, "/", body)
 	req.SetPathValue("id", roomID.String())
@@ -318,7 +335,7 @@ func TestCreate_EmptyContent(t *testing.T) {
 	repo.rooms[roomID] = true
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	body := strings.NewReader(`{"content":""}`)
 	req := httptest.NewRequest(http.MethodPost, "/", body)
 	req.SetPathValue("id", roomID.String())
@@ -334,7 +351,7 @@ func TestCreate_BadType(t *testing.T) {
 	repo.rooms[roomID] = true
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	body := strings.NewReader(`{"content":"hi","type":"gif"}`)
 	req := httptest.NewRequest(http.MethodPost, "/", body)
 	req.SetPathValue("id", roomID.String())
@@ -351,7 +368,7 @@ func TestCreate_StoreError(t *testing.T) {
 	userID := uuid.New()
 	repo.addMember(roomID, userID)
 	repo.createErr = errors.New("insert failed")
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 	body := strings.NewReader(`{"content":"hi"}`)
 	req := httptest.NewRequest(http.MethodPost, "/", body)
 	req.SetPathValue("id", roomID.String())
@@ -362,6 +379,67 @@ func TestCreate_StoreError(t *testing.T) {
 }
 
 // TestParseLimit is a table test over the clamp/default/validation rules.
+// TestCreate_Broadcasts asserts a successful post publishes a message.new
+// event carrying the joined author username to the room's live connections.
+func TestCreate_Broadcasts(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
+	repo.usernames[userID] = "alice"
+
+	pub := &fakePublisher{}
+	h := NewHandler(repo, pub)
+	body := strings.NewReader(`{"content":"hello world"}`)
+	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req.SetPathValue("id", roomID.String())
+	rec := authed(t, userID, h.create, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if len(pub.events) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(pub.events))
+	}
+	e := pub.events[0]
+	if e.Type != event.MessageNew {
+		t.Fatalf("expected type %q, got %q", event.MessageNew, e.Type)
+	}
+	if e.RoomID != roomID {
+		t.Fatalf("expected room %s, got %s", roomID, e.RoomID)
+	}
+	var got Message
+	if err := json.Unmarshal(e.Payload, &got); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if got.Username != "alice" {
+		t.Fatalf("expected broadcast to carry author username, got %+v", got)
+	}
+	if got.Content != "hello world" {
+		t.Fatalf("expected broadcast payload content, got %+v", got)
+	}
+}
+
+// TestCreate_NilPublisherNoPanic guards the REST-only path: a nil publisher
+// must not break posting.
+func TestCreate_NilPublisherNoPanic(t *testing.T) {
+	repo := newFakeRepo()
+	roomID := uuid.New()
+	repo.rooms[roomID] = true
+	userID := uuid.New()
+	repo.addMember(roomID, userID)
+
+	h := NewHandler(repo, nil)
+	body := strings.NewReader(`{"content":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req.SetPathValue("id", roomID.String())
+	rec := authed(t, userID, h.create, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 with nil publisher, got %d", rec.Code)
+	}
+}
+
 func TestParseLimit(t *testing.T) {
 	cases := []struct {
 		name    string

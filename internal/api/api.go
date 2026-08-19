@@ -13,6 +13,7 @@ import (
 	"github.com/R-zin/vili/internal/respond"
 	"github.com/R-zin/vili/internal/room"
 	"github.com/R-zin/vili/internal/user"
+	"github.com/R-zin/vili/internal/ws"
 )
 
 // Pinger reports database liveness for the readiness endpoint.
@@ -21,11 +22,13 @@ type Pinger interface {
 }
 
 // NewRouter builds the application's HTTP handler. tokens provides the auth
-// middleware for protected routes; db backs the readiness probe.
+// middleware for protected routes; db backs the readiness probe. realtime may
+// be nil, in which case no websocket route is registered (REST-only).
 func NewRouter(
 	users *user.Handler,
 	rooms *room.Handler,
 	messages *message.Handler,
+	realtime *ws.Handler,
 	tokens *auth.TokenService,
 	db Pinger,
 ) http.Handler {
@@ -52,6 +55,9 @@ func NewRouter(
 	require := tokens.Require
 	rooms.RegisterRoutes(mux, require)
 	messages.RegisterRoutes(mux, require)
+	if realtime != nil {
+		realtime.RegisterRoutes(mux, tokens.RequireWS)
+	}
 
 	return mux
 }

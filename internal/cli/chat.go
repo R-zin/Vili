@@ -8,18 +8,19 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
-// pollInterval is how often the chat view refetches history for new messages.
+// pollInterval is how often the (fallback) polling chat view refetches history.
 const pollInterval = 2 * time.Second
 
 // recentCount is how many messages are shown when entering chat.
 const recentCount = 20
 
-// cmdChat runs the interactive view: it renders recent history, then loops.
-// Each loop reads one input line (blocking between polls, so interrupts stay
-// responsive), sends it as a message, then polls and prints anything new. A
-// blank line just refreshes. /quit or Ctrl-C exits; /leave leaves the room.
+// cmdChat runs the interactive view. It shows recent history, then prefers the
+// realtime websocket (messages render as they arrive); if the socket can't be
+// established it falls back to polling. /quit or Ctrl-C exits; /leave leaves.
 func cmdChat(parent context.Context, out io.Writer, in io.Reader, c *Client, args []string) error {
 	if err := requireArgs(args, 1, "chat <room-id>"); err != nil {
 		return err
@@ -32,16 +33,33 @@ func cmdChat(parent context.Context, out io.Writer, in io.Reader, c *Client, arg
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	// Opening state: show recent history and start the cursor at the newest
-	// message so the poll only prints what arrives after entry.
+	// Opening state: show recent history so the room has context on entry.
 	messages, err := c.History(ctx, roomID, recentCount, nil)
 	if err != nil {
 		return err
 	}
 	printMessages(out, messages)
 	cursor := cursorFrom(messages)
-	fmt.Fprintln(out, "— chat: type a message and press enter; /quit to exit, /leave to leave —")
 
+	// Try realtime first: open the websocket and, on success, run the live loop.
+	conn, err := c.watch(ctx, roomID)
+	if err == nil {
+		fmt.Fprintln(out, "— live chat: type a message and press enter; /quit to exit, /leave to leave —")
+		defer conn.Close(websocket.StatusNormalClosure, "leaving")
+		push := make(chan wsEvent)
+		readEvents(conn, push)
+		return runRealtimeChat(ctx, out, c, roomID, conn, readLines(ctx, in), push)
+	}
+
+	// Fall back to polling when realtime is unavailable.
+	fmt.Fprintf(out, "— chat (polling, realtime unavailable: %s): /quit to exit, /leave to leave —\n", friendlyError(err))
+	return runPollingChat(ctx, out, in, c, roomID, cursor)
+}
+
+// runPollingChat is the original poll-based view, kept as the fallback when no
+// websocket can be opened. It renders history, then loops reading a line and
+// polling for what arrived after each.
+func runPollingChat(ctx context.Context, out io.Writer, in io.Reader, c *Client, roomID string, cursor *time.Time) error {
 	reader := bufio.NewReader(in)
 	for {
 		select {
@@ -74,8 +92,8 @@ func cmdChat(parent context.Context, out io.Writer, in io.Reader, c *Client, arg
 	}
 }
 
-// Sender/reporter signals for the chat loop, distinguished from real errors so
-// the loop can tell an intentional exit from a failure.
+// Sender/reporter signals for the polling loop, distinguished from real errors
+// so the loop can tell an intentional exit from a failure.
 var (
 	errQuit = errors.New("quit requested")
 	errLeft = errors.New("left room")
@@ -92,10 +110,10 @@ func cursorFrom(messages []Message) *time.Time {
 	return nil
 }
 
-// handleChatLine processes one input line: slash-commands act locally, blank
-// lines just refresh, anything else is sent. It then polls for and prints new
-// messages and returns the advanced cursor. A nil cursor is preserved when the
-// room has no messages yet.
+// handleChatLine processes one input line for the polling view: slash-commands
+// act locally, blank lines just refresh, anything else is sent. It then polls
+// for and prints new messages and returns the advanced cursor. A nil cursor is
+// preserved when the room has no messages yet.
 func handleChatLine(ctx context.Context, out io.Writer, c *Client, roomID, line string, cursor *time.Time) (*time.Time, error) {
 	switch {
 	case line == "/quit":

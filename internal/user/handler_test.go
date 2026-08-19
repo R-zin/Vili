@@ -50,6 +50,15 @@ func (f *fakeRepo) ByUsername(ctx context.Context, username string) (User, error
 	return u, nil
 }
 
+func (f *fakeRepo) UsernameByID(ctx context.Context, id uuid.UUID) (string, error) {
+	for _, u := range f.byUsername {
+		if u.ID == id {
+			return u.Username, nil
+		}
+	}
+	return "", ErrNotFound
+}
+
 func newTestHandler(t *testing.T, repo Repository) *Handler {
 	t.Helper()
 	tokens, err := auth.NewTokenService([]byte("test-secret-for-user-handler"), time.Hour)

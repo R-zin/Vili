@@ -5,6 +5,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -46,4 +47,33 @@ type Message struct {
 // statusResponse is the generic {"status": "..."} body used by join/leave.
 type statusResponse struct {
 	Status string `json:"status"`
+}
+
+// Realtime event types mirror the backend's event envelope
+// (internal/event). Payload is raw JSON decoded per type by the chat view.
+const (
+	eventMessageNew    = "message.new"
+	eventTyping        = "typing"
+	eventPresenceState = "presence.state"
+	eventPresenceJoin  = "presence.join"
+	eventPresenceLeave = "presence.leave"
+)
+
+// wsEvent mirrors the backend's realtime envelope: {type, room_id, payload}.
+type wsEvent struct {
+	Type    string          `json:"type"`
+	RoomID  string          `json:"room_id"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// presencePayload is the body of presence.state (online list) and
+// presence.join/leave (a single username).
+type presencePayload struct {
+	Online   []string `json:"online,omitempty"`
+	Username string   `json:"username,omitempty"`
+}
+
+// typingPayload is the body of a typing relay.
+type typingPayload struct {
+	Username string `json:"username"`
 }

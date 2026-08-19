@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vili — realtime demo</title>
+<style>
+  :root { color-scheme: light dark; --mono: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  * { box-sizing: border-box; }
+  body { font-family: var(--mono); margin: 0; padding: 1.5rem; max-width: 46rem; margin-inline: auto; line-height: 1.5; }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+  form { display: flex; gap: .5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  input, button { font: inherit; padding: .4rem .6rem; border: 1px solid #8884; border-radius: 6px; background: transparent; color: inherit; }
+  input { flex: 1 1 auto; min-width: 8rem; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  #log { border: 1px solid #8884; border-radius: 6px; padding: .75rem; height: 20rem; overflow-y: auto; white-space: pre-wrap; }
+  .msg { margin: .1rem 0; }
+  .meta { opacity: .6; }
+  .who { font-weight: 600; }
+  .sys { opacity: .55; font-style: italic; }
+  #bar { display: flex; gap: .5rem; align-items: center; margin-bottom: .5rem; font-size: .85rem; }
+  #status { opacity: .7; }
+  #typing { min-height: 1.2em; opacity: .6; font-style: italic; font-size: .85rem; margin: .25rem 0; }
+</style>
+</head>
+<body>
+  <h1>⚡ Vili — realtime demo</h1>
+  <div id="bar">
+    <span id="status">disconnected</span>
+    <span id="online" class="meta"></span>
+  </div>
+  <form id="connect">
+    <input id="base"   placeholder="server  (http://localhost:8080)" value="http://localhost:8080">
+    <input id="token"  placeholder="JWT (from: vili login …)" style="flex:2 1 auto">
+    <input id="room"   placeholder="room id">
+    <button type="submit">Connect</button>
+  </form>
+  <div id="log"></div>
+  <div id="typing"></div>
+  <form id="send">
+    <input id="text" placeholder="message… (Enter to send)" autocomplete="off" disabled>
+    <button id="sendbtn" type="submit" disabled>Send</button>
+  </form>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const log = $("log"), status = $("status"), onlineEl = $("online"), typingEl = $("typing");
+  const text = $("text"), sendBtn = $("sendbtn");
+  let ws = null, typingTimer = null, lastTypingSent = 0;
+
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const line = (cls, html) => {
+    const d = document.createElement("div");
+    d.className = "msg " + cls;
+    d.innerHTML = html;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+  };
+  const sys = (s) => line("sys", esc(s));
+
+  function wsURL(base, room) {
+    const u = new URL(base);
+    u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+    u.pathname = `/v1/rooms/${room}/ws`;
+    u.search = "";
+    return u.toString();
+  }
+
+  $("connect").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const base = $("base").value.trim(), token = $("token").value.trim(), room = $("room").value.trim();
+    if (!base || !token || !room) { sys("server, JWT, and room id are required"); return; }
+    if (ws) ws.close();
+
+    // Browsers can't set Authorization on the WebSocket handshake, so this demo
+    // passes the token as a subprotocol-free query the server accepts via the
+    // Authorization header alternative (see note). For the demo we send it as a
+    // subprotocol token: the Go CLI uses the header; this page uses ?token=.
+    const url = wsURL(base, room) + "?token=" + encodeURIComponent(token);
+    ws = new WebSocket(url);
+    status.textContent = "connecting…";
+
+    ws.onopen = () => {
+      status.textContent = "connected (live)";
+      text.disabled = sendBtn.disabled = false;
+      text.focus();
+      sys("joined " + room);
+    };
+    ws.onclose = () => {
+      status.textContent = "disconnected";
+      text.disabled = sendBtn.disabled = true;
+      onlineEl.textContent = ""; typingEl.textContent = "";
+      sys("connection closed");
+    };
+    ws.onerror = () => sys("connection error (check server, token, room, and that you are a member)");
+
+    ws.onmessage = (m) => {
+      let e; try { e = JSON.parse(m.data); } catch { return; }
+      const p = e.payload ? (typeof e.payload === "string" ? JSON.parse(e.payload) : e.payload) : {};
+      switch (e.type) {
+        case "message.new": {
+          const t = new Date(p.created_at).toLocaleTimeString();
+          line("", `<span class="meta">${esc(t)}</span>  <span class="who">${esc(p.username)}</span>: ${esc(p.content)}`);
+          break;
+        }
+        case "presence.state":
+          onlineEl.textContent = "online: " + (p.online && p.online.length ? p.online.join(", ") : "just you");
+          break;
+        case "presence.join": sys(p.username + " joined"); break;
+        case "presence.leave": sys(p.username + " left"); break;
+        case "typing":
+          typingEl.textContent = p.username + " is typing…";
+          clearTimeout(typingTimer);
+          typingTimer = setTimeout(() => typingEl.textContent = "", 2500);
+          break;
+      }
+    };
+  });
+
+  text.addEventListener("input", () => {
+    const now = Date.now();
+    if (ws && ws.readyState === 1 && now - lastTypingSent > 2000) {
+      lastTypingSent = now;
+      ws.send(JSON.stringify({ type: "typing" }));
+    }
+  });
+
+  $("send").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const content = text.value.trim();
+    if (!content) return;
+    text.value = "";
+    // Send still goes over REST (source of truth); the socket delivers the echo.
+    try {
+      const room = $("room").value.trim();
+      const res = await fetch($("base").value.trim() + `/v1/rooms/${room}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "authorization": "Bearer " + $("token").value.trim() },
+        body: JSON.stringify({ content, type: "text" }),
+      });
+      if (!res.ok) sys("send failed: HTTP " + res.status);
+    } catch (err) {
+      sys("send failed: " + err.message);
+    }
+  });
+})();
+</script>
+</body>
+</html>

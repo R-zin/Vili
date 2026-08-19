@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/R-zin/vili/internal/auth"
+	"github.com/R-zin/vili/internal/event"
 	"github.com/R-zin/vili/internal/respond"
 )
 
@@ -27,15 +29,26 @@ const (
 	contentMaxLen = 4000
 )
 
+// Publisher broadcasts a freshly-posted message to a room's live websocket
+// connections. It lets the message feature publish without importing the ws
+// feature (features never import each other); the wiring layer satisfies it
+// with the realtime hub, and a nil publisher disables broadcasting (REST-only
+// Phase-3 deployments).
+type Publisher interface {
+	Broadcast(roomID uuid.UUID, e event.Event)
+}
+
 // Handler serves the message feature's routes. They are protected; the wiring
 // layer mounts them behind the auth middleware.
 type Handler struct {
-	repo Repository
+	repo      Repository
+	publisher Publisher
 }
 
-// NewHandler builds a message Handler.
-func NewHandler(repo Repository) *Handler {
-	return &Handler{repo: repo}
+// NewHandler builds a message Handler. publisher may be nil, in which case
+// posting only persists (no realtime broadcast).
+func NewHandler(repo Repository, publisher Publisher) *Handler {
+	return &Handler{repo: repo, publisher: publisher}
 }
 
 // RegisterRoutes mounts the protected message routes on the mux, each wrapped
@@ -94,6 +107,17 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		}
 		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not post message", err)
 		return
+	}
+
+	// Publish the persisted message to the room's live connections. REST is the
+	// source of truth: the row is already stored, and a broadcast failure must
+	// not fail the post, so it is logged, not returned.
+	if h.publisher != nil {
+		if e, err := event.NewMessage(roomID, msg); err != nil {
+			slog.Error("could not encode message broadcast", "error", err)
+		} else {
+			h.publisher.Broadcast(roomID, e)
+		}
 	}
 
 	respond.JSON(w, http.StatusCreated, msg)

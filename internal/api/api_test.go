@@ -36,7 +36,8 @@ func newRouter(t *testing.T, p Pinger) http.Handler {
 	return NewRouter(
 		user.NewHandler(nil, tokens), // repo unused by health/ready/protected-no-token
 		room.NewHandler(nil),
-		message.NewHandler(nil),
+		message.NewHandler(nil, nil),
+		nil, // realtime handler unused by these router tests
 		tokens,
 		p,
 	)

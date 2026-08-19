@@ -43,6 +43,21 @@ func (r *PostgresRepository) Create(ctx context.Context, username, passwordHash 
 	return u, nil
 }
 
+// UsernameByID returns just the username for the given id or ErrNotFound.
+func (r *PostgresRepository) UsernameByID(ctx context.Context, id uuid.UUID) (string, error) {
+	var username string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT username FROM users WHERE id = $1`, id,
+	).Scan(&username)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("user: username by id: %w", err)
+	}
+	return username, nil
+}
+
 // ByUsername returns the user with the given username or ErrNotFound.
 func (r *PostgresRepository) ByUsername(ctx context.Context, username string) (User, error) {
 	var u User

@@ -46,4 +46,7 @@ type Repository interface {
 	Create(ctx context.Context, username, passwordHash string) (User, error)
 	// ByUsername looks up a user, returning ErrNotFound when absent.
 	ByUsername(ctx context.Context, username string) (User, error)
+	// UsernameByID returns only the username for an id, returning ErrNotFound
+	// when absent. It backs realtime presence, which authenticates by id.
+	UsernameByID(ctx context.Context, id uuid.UUID) (string, error)
 }

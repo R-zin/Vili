@@ -31,7 +31,7 @@ Commands:
                                      print room history, oldest first
   send <room-id> <message...> [--type text|diff|code|log|commit]
                                      post a message
-  chat <room-id>                     interactive view: watch + type messages
+  chat <room-id>                     live view: realtime messages, presence, typing
 
 Global flags:
   --server URL   backend base URL (default http://localhost:8080; persists in session)

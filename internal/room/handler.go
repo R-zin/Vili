@@ -38,8 +38,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, require func(http.HandlerFu
 	mux.Handle("GET /v1/listrooms", require(h.list))
 	mux.Handle("POST /v1/rooms/{id}/join", require(h.join))
 	mux.Handle("POST /v1/rooms/{id}/leave", require(h.leave))
-	// Realtime: GET /v1/rooms/{id}/ws is a Phase 4 websocket route and is
-	// intentionally not registered in Phase 1.
+	// Realtime: GET /v1/rooms/{id}/ws is served by the ws feature package and
+	// mounted by the api wiring layer, not here.
 }
 
 type createRoomRequest struct {
