@@ -66,7 +66,7 @@ func TestEvictIdle(t *testing.T) {
 	l.buckets["fresh"].last = base.Add(ttl + time.Minute)
 	l.buckets["stale"].last = base
 
-	l.evictIdle(base.Add(ttl + 2 * time.Minute))
+	l.evictIdle(base.Add(ttl + 2*time.Minute))
 
 	if l.size() != 1 {
 		t.Fatalf("expected 1 live bucket after eviction, got %d", l.size())

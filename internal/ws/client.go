@@ -61,7 +61,12 @@ func (c *Client) run(ctx context.Context) {
 	c.closeCancel = cancel
 	defer cancel()
 
-	c.hub.Join(c.roomID, c)
+	if !c.hub.Join(c.roomID, c) {
+		// Refused: the hub is closed (shutdown race) or the user hit the
+		// connection cap after the pre-upgrade check. Tear down cleanly.
+		c.close(websocket.StatusGoingAway, "connection refused")
+		return
+	}
 	// Send the freshly-joined client the current presence state, then tell the
 	// room someone arrived.
 	c.sendNow(event.NewPresenceState(c.roomID, c.hub.Presence(c.roomID)))

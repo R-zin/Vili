@@ -20,23 +20,40 @@ type Hub struct {
 	mu sync.RWMutex
 	// rooms maps a room id to its set of connected clients.
 	rooms map[uuid.UUID]map[*Client]struct{}
+	// userCounts maps a user id to its total live connections across all rooms,
+	// enforcing MaxConnsPerUser so one account can't pin unbounded sockets.
+	userCounts map[uuid.UUID]int
+	// maxPerUser caps concurrent connections per user; <=0 means unlimited.
+	maxPerUser int
 	// closed reports whether Close has been called; a closed hub rejects new
 	// joins so no client outlives shutdown.
 	closed bool
 }
 
-// NewHub builds an empty Hub.
+// NewHub builds an empty Hub with no per-user connection cap.
 func NewHub() *Hub {
-	return &Hub{rooms: make(map[uuid.UUID]map[*Client]struct{})}
+	return &Hub{rooms: make(map[uuid.UUID]map[*Client]struct{}), userCounts: make(map[uuid.UUID]int)}
 }
 
-// Join adds c to its room. A closed hub refuses so late connections cannot
-// register after shutdown has begun.
-func (h *Hub) Join(roomID uuid.UUID, c *Client) {
+// SetMaxConnsPerUser sets the concurrent-connection cap applied per user. A
+// value <= 0 disables the cap. It is set once during wiring.
+func (h *Hub) SetMaxConnsPerUser(n int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.maxPerUser = n
+}
+
+// Join adds c to its room and increments the user's connection count. It
+// returns false when the hub is closed (so late connections cannot register
+// after shutdown) or when the user is already at the per-user cap.
+func (h *Hub) Join(roomID uuid.UUID, c *Client) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
-		return
+		return false
+	}
+	if h.maxPerUser > 0 && h.userCounts[c.userID] >= h.maxPerUser {
+		return false
 	}
 	set, ok := h.rooms[roomID]
 	if !ok {
@@ -44,9 +61,12 @@ func (h *Hub) Join(roomID uuid.UUID, c *Client) {
 		h.rooms[roomID] = set
 	}
 	set[c] = struct{}{}
+	h.userCounts[c.userID]++
+	return true
 }
 
-// Leave removes c from its room, deleting the room's entry when it empties.
+// Leave removes c from its room, deleting the room's entry when it empties
+// and decrementing the user's connection count.
 func (h *Hub) Leave(roomID uuid.UUID, c *Client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -57,6 +77,12 @@ func (h *Hub) Leave(roomID uuid.UUID, c *Client) {
 	delete(set, c)
 	if len(set) == 0 {
 		delete(h.rooms, roomID)
+	}
+	if h.userCounts[c.userID] > 0 {
+		h.userCounts[c.userID]--
+		if h.userCounts[c.userID] == 0 {
+			delete(h.userCounts, c.userID)
+		}
 	}
 }
 
@@ -74,6 +100,22 @@ func (h *Hub) Broadcast(roomID uuid.UUID, e event.Event) {
 	for _, c := range clients {
 		c.sendNow(e)
 	}
+}
+
+// ConnCount returns the number of live connections held by userID across all
+// rooms. The handler uses it to reject an over-cap upgrade with 429 before
+// hijacking; Join remains the authoritative atomic check.
+func (h *Hub) ConnCount(userID uuid.UUID) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.userCounts[userID]
+}
+
+// MaxConnsPerUser returns the configured per-user cap (<=0 means unlimited).
+func (h *Hub) MaxConnsPerUser() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.maxPerUser
 }
 
 // Presence returns the deduplicated usernames currently connected to roomID.
@@ -110,6 +152,7 @@ func (h *Hub) Close() {
 		}
 	}
 	h.rooms = make(map[uuid.UUID]map[*Client]struct{})
+	h.userCounts = make(map[uuid.UUID]int)
 	h.mu.Unlock()
 
 	for _, c := range clients {

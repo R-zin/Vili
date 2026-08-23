@@ -8,6 +8,7 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"strconv"
 	"sync"
@@ -86,6 +87,16 @@ func classOf(status int) string {
 
 // InFlight returns the current in-flight gauge value. Used in tests.
 func (r *Registry) InFlight() int64 { return r.inFlight.Load() }
+
+// Handler returns an http.Handler that renders the registry in the Prometheus
+// text exposition format for the /metrics endpoint. It is served unversioned;
+// the route is registered by the wiring layer only when metrics are enabled.
+func (r *Registry) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		r.Render(w)
+	})
+}
 
 // Render writes the registry in the Prometheus text exposition format.
 func (r *Registry) Render(w io.Writer) {
