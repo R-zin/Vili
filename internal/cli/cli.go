@@ -13,6 +13,14 @@ import (
 // defaultServer is used when neither a flag nor a stored session says otherwise.
 const defaultServer = "http://localhost:8080"
 
+// Version is the build version printed by "vili version". Release builds
+// (GoReleaser) inject it via -ldflags "-X .../internal/cli.version=x.y.z";
+// `go build` leaves the "dev" default.
+var version = "dev"
+
+// Version returns the build version string.
+func Version() string { return version }
+
 // usage is printed for no/unknown subcommand and on --help.
 const usage = `vili — terminal client for the Vili chat backend
 
@@ -32,6 +40,7 @@ Commands:
   send <room-id> <message...> [--type text|diff|code|log|commit]
                                      post a message
   chat <room-id>                     live view: realtime messages, presence, typing
+  version                            print the build version
 
 Global flags:
   --server URL   backend base URL (default http://localhost:8080; persists in session)
@@ -63,6 +72,12 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
+
+	// version needs no session, client, or network.
+	if cmd == "version" {
+		fmt.Fprintf(out, "vili %s\n", version)
+		return nil
+	}
 
 	// Resolve session + base URL. Flag wins, then stored session, then default.
 	sess, _ := LoadSession() // ignore ErrNoSession; treated as nil

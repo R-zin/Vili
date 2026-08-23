@@ -69,6 +69,15 @@ func (h *Handler) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-user connection cap, checked before the upgrade so the refusal is a
+	// normal HTTP error envelope rather than an abrupt socket close. The hub's
+	// Join re-checks atomically as a safety net.
+	if max := h.hub.MaxConnsPerUser(); max > 0 && h.hub.ConnCount(userID) >= max {
+		w.Header().Set("Retry-After", "1")
+		respond.Error(w, http.StatusTooManyRequests, "rate_limited", "too many concurrent connections")
+		return
+	}
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: h.originPatterns})
 	if err != nil {
 		// Accept already wrote the failure response; nothing more to send.

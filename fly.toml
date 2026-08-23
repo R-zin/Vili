@@ -1,0 +1,44 @@
+# fly.io deployment manifest for the Vili backend.
+#
+# Build uses the repo-root Dockerfile (multi-stage, distroless). Secrets are
+# injected with `fly secrets set DATABASE_URL=... JWT_SECRET=...` and are never
+# committed. The single important non-secret env var is PORT.
+#
+#   fly launch --no-deploy        # create the app (adopt the generated app name)
+#   fly secrets set DATABASE_URL=postgres://... JWT_SECRET=<long-random>
+#   fly deploy
+
+app = "vili-server"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # Fail-fast config pairs with the distroless image: if a required secret is
+  # missing the process exits and fly restarts it, surfacing the misconfig.
+  # All other limits (rate limiting, body cap, timeouts) ship as tuned defaults;
+  # override any of them here or per-machine.
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  # Readiness gates traffic: only a machine whose DB ping succeeds is routable.
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/ready"
+
+# Persistent WebSockets: the realtime route upgrades in place, so keep
+# connection draining generous on shutdown.
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

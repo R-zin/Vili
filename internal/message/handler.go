@@ -52,10 +52,18 @@ func NewHandler(repo Repository, publisher Publisher) *Handler {
 }
 
 // RegisterRoutes mounts the protected message routes on the mux, each wrapped
-// in the auth middleware provided by require.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux, require func(http.HandlerFunc) http.Handler) {
+// in the auth middleware provided by require. The create route additionally
+// applies the per-user rate-limiter mw INSIDE the auth wrapper (require(mw)),
+// so the limiter keys on the authenticated user id that require stores in the
+// context. mw may be nil to skip limiting. The read route is left unthrottled
+// so scrolling history isn't capped.
+func (h *Handler) RegisterRoutes(mux *http.ServeMux, require func(http.HandlerFunc) http.Handler, mw func(http.HandlerFunc) http.HandlerFunc) {
 	mux.Handle("GET /v1/rooms/{id}/messages", require(h.list))
-	mux.Handle("POST /v1/rooms/{id}/messages", require(h.create))
+	create := h.create
+	if mw != nil {
+		create = mw(create)
+	}
+	mux.Handle("POST /v1/rooms/{id}/messages", require(create))
 }
 
 // createMessageRequest is the body for posting a message. Type is optional and

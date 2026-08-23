@@ -1,0 +1,67 @@
+# GoReleaser config: builds the `vili` CLI for darwin/linux on amd64+arm64 and
+# publishes a GitHub release with archives and checksums. No new dependency —
+# this is a release-time config consumed only by the goreleaser CLI in CI.
+#
+# The version is injected into the binary via -X so `vili version` reports it.
+version: 2
+
+project_name: vili
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: vili
+    main: ./cmd/vili
+    binary: vili
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/R-zin/vili/internal/cli.version={{ .Version }}
+
+archives:
+  - id: vili
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}_
+      {{- .Arch }}
+    # Windows zip would go here; the CLI targets unix terminals for now.
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "Merge pull request"
+      - "Merge branch"
+
+# Homebrew tap. GoReleaser generates and pushes Formula/vili.rb to the tap repo
+# on each tag. Requires a separate `R-zin/homebrew-tap` GitHub repo and a
+# HOMEBREW_TAP_GITHUB_TOKEN secret with write access to it. See Formula/vili.rb
+# for the hand-written equivalent until a tap repo exists.
+brews:
+  - name: vili
+    repository:
+      owner: R-zin
+      name: homebrew-tap
+    directory: Formula
+    homepage: "https://github.com/R-zin/Vili"
+    description: "Terminal-first chat client for the Vili backend"
+    license: "MIT"
+    test: |
+      assert_match("vili", shell_output("#{bin}/vili version"))

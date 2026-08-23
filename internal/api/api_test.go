@@ -40,6 +40,7 @@ func newRouter(t *testing.T, p Pinger) http.Handler {
 		nil, // realtime handler unused by these router tests
 		tokens,
 		p,
+		Middleware{},
 	)
 }
 

@@ -39,10 +39,19 @@ type loginResponse struct {
 	User  Public `json:"user"`
 }
 
-// RegisterRoutes mounts the public auth routes on the mux.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/auth/register", h.register)
-	mux.HandleFunc("POST /v1/auth/login", h.login)
+// RegisterRoutes mounts the public auth routes on the mux. wrap applies to all
+// of them (the wiring layer passes its per-IP rate limiter, or nil to skip).
+func (h *Handler) RegisterRoutes(mux *http.ServeMux, wrap func(http.Handler) http.Handler) {
+	mux.Handle("POST /v1/auth/register", apply(wrap, h.register))
+	mux.Handle("POST /v1/auth/login", apply(wrap, h.login))
+}
+
+// apply wraps fn with the middleware, or returns fn untouched when mw is nil.
+func apply(mw func(http.Handler) http.Handler, fn http.HandlerFunc) http.Handler {
+	if mw == nil {
+		return fn
+	}
+	return mw(fn)
 }
 
 func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
