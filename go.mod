@@ -10,7 +10,7 @@ require (
 
 require github.com/coder/websocket v1.8.15
 
-require golang.org/x/time v0.15.0 // indirect
+require golang.org/x/time v0.15.0
 
 require (
 	github.com/google/uuid v1.6.0
