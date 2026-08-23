@@ -1,0 +1,42 @@
+# Keep the build context small and free of secrets for the Dockerfile build.
+
+# VCS + metadata
+.git/
+.gitignore
+.github/
+.agenthub/
+.claude/
+.idea/
+.vscode/
+
+# Secrets & local env — never bake into an image
+.env
+.env.local
+*.env
+!.env.example
+
+# Build artifacts / local binaries
+/bin/
+/dist/
+/vili
+/vili-server
+*.exe
+*.test
+
+# Test/coverage output
+coverage.out
+*.coverprofile
+*.out
+
+# Docs & demo assets not needed by the server binary
+README.md
+index.html
+
+# Docker/release metadata itself
+Dockerfile
+.dockerignore
+fly.toml
+.goreleaser.yml
+
+# OS noise
+.DS_Store

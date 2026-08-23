@@ -7,11 +7,12 @@ import (
 // CORS returns middleware implementing an explicit cross-origin policy.
 //
 // Decision (conscious): the API is consumed by the terminal CLI (no Origin
-// header) and by the bundled index.html demo, which is served from the same
-// host as the API — same-origin requests are never subject to CORS. So the
-// default is DENY: with an empty allowlist no Access-Control-Allow-Origin is
-// ever emitted, and cross-origin browser calls fail. Operators that host a
-// web client elsewhere add its origin(s) to the allowlist (CORS_ALLOWED_ORIGINS).
+// header) and by the bundled index.html demo, which is opened directly as a
+// local file (its Origin is "null", and it sends the token explicitly) — none
+// of these paths rely on a cross-origin CORS grant. So the default is DENY:
+// with an empty allowlist no Access-Control-Allow-Origin is ever emitted and
+// cross-origin browser calls are blocked client-side. Operators that host a
+// web client on a real origin add it to the allowlist (CORS_ALLOWED_ORIGINS).
 //
 // Allowed origins get a reflected Allow-Origin, a credential-free policy, the
 // methods/headers the API actually uses, and a handled preflight (OPTIONS).

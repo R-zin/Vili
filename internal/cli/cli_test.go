@@ -163,6 +163,19 @@ func TestNoCommandShowsUsage(t *testing.T) {
 	}
 }
 
+func TestVersionCommand(t *testing.T) {
+	isolateConfig(t)
+	var out bytes.Buffer
+	// version needs no session or server; it must work in a bare environment.
+	if err := Run(context.Background(), &out, strings.NewReader(""), []string{"version"}); err != nil {
+		t.Fatalf("version returned error: %v", err)
+	}
+	got := strings.TrimSpace(out.String())
+	if got != "vili "+Version() {
+		t.Fatalf("version output = %q, want %q", got, "vili "+Version())
+	}
+}
+
 func TestPollAfterFiltersToNewerThanCursor(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/rooms/r1/messages" {

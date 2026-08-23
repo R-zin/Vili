@@ -1,0 +1,49 @@
+name: Release
+
+# Build and publish `vili` CLI binaries + a Homebrew formula on every version
+# tag. Push a tag like `v0.1.0` to trigger it.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the GitHub release and upload assets
+  packages: write
+
+env:
+  GO_VERSION: "1.26.5"
+
+jobs:
+  goreleaser:
+    name: GoReleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so changelog + tag resolution work
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Gate on the same checks as CI before cutting a release.
+      - name: Build / vet / test
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Set this repo secret to a PAT with write access to R-zin/homebrew-tap
+          # for automatic formula publishing. Without it, disable the "brews:"
+          # stanza in .goreleaser.yml or the brew step fails.
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

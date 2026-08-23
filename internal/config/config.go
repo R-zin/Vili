@@ -71,9 +71,10 @@ type Security struct {
 	// HeadersEnabled toggles the security-headers middleware.
 	HeadersEnabled bool
 	// CORSAllowedOrigins is the explicit cross-origin allowlist. Empty means
-	// deny-by-default: no cross-origin browser requests are permitted (the
-	// same-origin CLI and the index.html demo served from the API host are
-	// unaffected). Entries are scheme://host[:port] origins.
+	// deny-by-default: no cross-origin browser requests are permitted (the CLI
+	// sends no Origin header and the index.html demo is opened as a local
+	// file, so neither needs a CORS grant). Entries are scheme://host[:port]
+	// origins.
 	CORSAllowedOrigins []string
 }
 
