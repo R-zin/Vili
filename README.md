@@ -25,20 +25,25 @@ auth, users, rooms, membership, and messages; the CLI stays a thin, opinionated 
 
 ## Status
 
-**Phases 1–4: backend + CLI + real-time delivery, complete and green.** The HTTP API,
-authentication, room and message persistence, migrations, and a full no-DB unit-test
-suite are done. **Message history and posting are membership-gated.** The `vili`
+**Phases 1–5: backend + CLI + real-time delivery + production hardening, complete and green.**
+The HTTP API, authentication, room and message persistence, migrations, and a full no-DB
+unit-test suite are done. **Message history and posting are membership-gated.** The `vili`
 terminal CLI signs in with a saved session, browses rooms, and chats in a **live view**:
 messages, presence, and typing arrive over WebSocket as they happen (no Enter needed),
 with automatic fallback to polling when the socket can't be established.
-See [Quickstart (CLI)](#quickstart-cli) and [Real-time](#real-time).
+Phase 5 adds **hardening, observability, and rate limiting** plus a Docker/fly deployment
+path and a **Homebrew install**. See [Deployment](#deployment), [Install (Homebrew)](#install-homebrew),
+and [Security](#security).
 
 ## Features
 
 - **Accounts & auth** — register/login, bcrypt password hashing, short-lived **JWT (HS256)** access tokens with a hardened verification path (no algorithm confusion, no panicking claim assertions, fail-fast on an empty secret).
 - **Rooms & membership** — create/list rooms, join/leave, owner/member roles. Message history is **membership-gated** by the backend.
 - **Messages** — persisted in PostgreSQL, typed payloads (`text`, `diff`, `code`, `log`, `commit`), cursor-paginated history (`before` + `limit`).
-- **Production hygiene** — env-based config with fail-fast required vars, HTTP timeouts, graceful shutdown, structured `log/slog` logging, uniform JSON error envelopes, migrations tracked in `schema_migrations`, and a real test suite (unit + optional env-gated integration).
+- **Real-time** — membership-gated WebSocket delivery (messages, presence, typing) with a per-user concurrent-connection cap.
+- **Hardening** — security headers, JSON body-size caps, panic-recovery to a uniform 500 envelope, explicit deny-by-default CORS, and per-IP / per-user token-bucket rate limiting (`429` + `Retry-After`).
+- **Observability** — structured `log/slog` access logs (never tokens or bodies), a hand-rolled Prometheus `/metrics` endpoint, and `net/http/pprof` behind a default-off flag.
+- **Production hygiene** — env-based config with fail-fast required vars, HTTP timeouts, graceful shutdown, uniform JSON error envelopes, migrations tracked in `schema_migrations`, a multi-stage distroless Dockerfile, a Homebrew-tap release pipeline, and a real test suite (unit + optional env-gated integration).
 
 ## Architecture
 
@@ -55,9 +60,13 @@ internal/
   user/        accounts: types, Postgres repo, register/login handlers
   room/        rooms & membership: types, repo, handlers
   message/     messages: types, repo, membership-gated handler + post broadcast
-  ws/          realtime: in-memory hub, per-connection pumps, WS upgrade handler
+  ws/          realtime: in-memory hub (per-user conn cap), pumps, WS upgrade handler
   event/       realtime wire envelope (tiny leaf shared by message & ws)
   auth/        bcrypt + JWT (issue/verify) + auth middleware (HTTP + WS) + ctx accessor
+  httputil/    cross-cutting middleware: recovery, security headers, body cap,
+               deny-by-default CORS, request logging/metrics, rate limiting, pprof
+  metrics/     hand-rolled Prometheus text registry (counters, histogram, gauge)
+  ratelimit/   per-key token buckets over golang.org/x/time/rate, with eviction
   config/      env-only configuration, validated at startup
   store/       pgx/v5 (stdlib) connection + embedded migrations
   respond/     JSON responses + uniform error envelope
@@ -145,8 +154,14 @@ All endpoints are versioned under `/v1`. Protected routes require
 | POST | `/v1/rooms/{id}/join` | ✔ | Join a room (member role) → `200` |
 | POST | `/v1/rooms/{id}/leave` | ✔ | Leave a room → `200` |
 | GET | `/v1/rooms/{id}/messages` | ✔ | Room history (`?limit=` 1–100, `?before=` RFC3339) → `200`. **Members only.** |
-| POST | `/v1/rooms/{id}/messages` | ✔ | Post a message `{content, type?}` → `201`. **Members only.** Broadcast to the room's live connections. |
-| GET | `/v1/rooms/{id}/ws` | ✔ | Real-time WebSocket upgrade (messages, presence, typing). **Members only.** See [Real-time](#real-time). |
+| POST | `/v1/rooms/{id}/messages` | ✔ | Post a message `{content, type?}` → `201`. **Members only.** Broadcast to the room's live connections. Per-user rate limit → `429`. |
+| GET | `/v1/rooms/{id}/ws` | ✔ | Real-time WebSocket upgrade (messages, presence, typing). **Members only.** Per-user connection cap → `429`. See [Real-time](#real-time). |
+
+Cross-cutting behavior worth knowing:
+
+- `/v1/auth/*` is **rate-limited per client IP**; message POSTs are limited per **user**. Exceeding a budget returns `429` with a `Retry-After` header and a `rate_limited` envelope.
+- All JSON request bodies are capped (`MAX_BODY_BYTES`), oversized requests fail the decode.
+- Operational endpoints (not part of the versioned contract, all public): `GET /metrics` serves Prometheus text when `METRICS_ENABLED`; `GET /debug/pprof/*` serves runtime profiles only when `PPROF_ENABLED=true` (default off).
 
 Errors share one envelope; success responses are plain resource JSON:
 
@@ -204,17 +219,89 @@ server exits non-zero if either is missing/empty.
 | `HTTP_WRITE_TIMEOUT` | — | `15s` | Response write timeout |
 | `HTTP_IDLE_TIMEOUT` | — | `60s` | Keep-alive idle timeout |
 | `SHUTDOWN_TIMEOUT` | — | `10s` | Graceful-shutdown deadline |
-| `DB_MAX_OPEN_CONNS` | — | `10` | Max open DB connections |
-| `DB_MAX_IDLE_CONNS` | — | `5` | Max idle DB connections |
+| `DB_MAX_OPEN_CONNS` | — | `25` | Max open DB connections |
+| `DB_MAX_IDLE_CONNS` | — | `25` | Max idle DB connections |
 | `DB_CONN_MAX_LIFETIME` | — | `5m` | Max connection lifetime |
+| `MAX_BODY_BYTES` | — | `1048576` (1 MiB) | Max bytes for any JSON request body |
+| `SECURITY_HEADERS_ENABLED` | — | `true` | Send security headers on every response |
+| `CORS_ALLOWED_ORIGINS` | — | _(empty)_ | Comma-separated cross-origin allowlist; empty = deny-by-default |
+| `RATE_LIMIT_ENABLED` | — | `true` | Master switch for token-bucket limiting |
+| `RATE_LIMIT_AUTH_RPS` | — | `5` | Sustained req/s per IP on `/v1/auth/*` |
+| `RATE_LIMIT_AUTH_BURST` | — | `10` | Burst size per IP on `/v1/auth/*` |
+| `RATE_LIMIT_MESSAGES_RPS` | — | `10` | Sustained req/s per user on message POST |
+| `RATE_LIMIT_MESSAGES_BURST` | — | `20` | Burst size per user on message POST |
+| `WS_MAX_CONNS_PER_USER` | — | `5` | Max concurrent WebSocket connections per user |
+| `REQUEST_LOG_ENABLED` | — | `true` | Per-request access log (no tokens/bodies) |
+| `METRICS_ENABLED` | — | `true` | Serve Prometheus text at `/metrics` |
+| `PPROF_ENABLED` | — | `false` | Mount `net/http/pprof` at `/debug/pprof` (trusted envs only) |
 
 ## Security
 
 - **Passwords** hashed with bcrypt at `DefaultCost`; verification uses constant-time compare. Hashes are never serialized to clients.
 - **JWT**: `golang-jwt/jwt/v5`, HS256 only. Verification enforces the HMAC method inside the keyfunc (blocks algorithm-confusion), requires `HS256` + an expiry, and extracts the subject via typed access (no panicking type assertions). The signing secret is injected and must be non-empty at startup.
 - **Auth**: login returns a generic `401` for any credential failure (no user-enumeration signal).
-- **No leaks**: internal/SQL errors are logged server-side, never returned; secrets, tokens, and password hashes never appear in responses or logs.
-- **Input** is validated before any DB call; IDs parsed as UUIDs; query bounds clamped.
+- **No leaks**: internal/SQL errors are logged server-side, never returned; secrets, tokens, and password hashes never appear in responses or logs. The access log records only method, route, status, and duration — never the `Authorization` header, query strings (which may carry a WS `?token=`), or bodies.
+- **Input** is validated before any DB call; IDs parsed as UUIDs; query bounds clamped. JSON bodies are capped (`MAX_BODY_BYTES`) so a client can't stream an unbounded body.
+- **Headers**: every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a restrictive `Content-Security-Policy`.
+- **Recovery**: a handler panic is caught and returned as the uniform `500` envelope (with the stack logged server-side), never a dropped connection.
+- **CORS**: deny-by-default. No `Access-Control-Allow-Origin` is emitted unless the request `Origin` is in `CORS_ALLOWED_ORIGINS`. The CLI sends no `Origin` header and the `index.html` demo is opened as a local file, so neither needs a browser CORS grant.
+- **Rate limiting**: token-bucket limiters (per-IP on `/v1/auth/*`, per-user on message POST) return `429` + `Retry-After` when exceeded; WebSocket connections are capped per user. Buckets are evicted when idle so a spoofed-IP flood can't grow memory unboundedly; `X-Forwarded-For` is ignored for keying (no trusted-proxy config, so it's spoofable).
+
+## Observability
+
+- **Access logs** — one structured `log/slog` line per request with `method`, `route` (the mux pattern, e.g. `/v1/rooms/{id}/messages`), `status`, and `duration_ms`. Toggle with `REQUEST_LOG_ENABLED`.
+- **Metrics** — `GET /metrics` serves hand-rolled Prometheus text (no client dependency): `vili_http_requests_in_flight` (gauge), `vili_http_requests_total{method,route,status_class}` (counter), and `vili_http_request_duration_seconds{method,route}` (histogram). Toggle with `METRICS_ENABLED`. Scrape it with any Prometheus-compatible collector.
+- **Profiling** — `net/http/pprof` under `/debug/pprof/*`, mounted **only** when `PPROF_ENABLED=true` (default off). Profiles expose goroutine stacks, heap, and traces; enable only in a trusted environment.
+
+## Deployment
+
+### Docker
+
+The repo-root `Dockerfile` is multi-stage: it builds a fully-static binary (`CGO_ENABLED=0`, `-trimpath`) and copies it into a non-root **distroless** final image with CA roots so TLS to managed Postgres verifies. `.dockerignore` keeps the build context free of secrets and VCS noise.
+
+```bash
+docker build -t vili-server .
+docker run --rm -p 8080:8080 \
+  -e DATABASE_URL=postgres://user:pass@host:5432/vili \
+  -e JWT_SECRET="$(openssl rand -hex 32)" \
+  vili-server
+```
+
+### fly.io
+
+`fly.toml` is included: it builds via the Dockerfile, forces HTTPS, and gates traffic on the `/ready` health check.
+
+```bash
+fly launch --no-deploy
+fly secrets set DATABASE_URL=postgres://... JWT_SECRET=<long-random>
+fly deploy
+```
+
+## Install (Homebrew)
+
+The `vili` CLI is released for **macOS and Linux, amd64 + arm64** by GoReleaser on every `v*` tag (see `.goreleaser.yml` and `.github/workflows/release.yml`), with the build version injected so `vili version` reports it.
+
+Once the tap repo exists, install with:
+
+```bash
+brew tap R-zin/tap
+brew install vili
+```
+
+Until the tap is published, two options:
+
+- **Download a release binary** from the GitHub Releases page and put it on your `PATH`.
+- **Build from source** with the committed formula or directly:
+
+  ```bash
+  brew install --build-from-source ./Formula/vili.rb   # or:
+  go install github.com/R-zin/vili/cmd/vili@latest
+  ```
+
+> **Tap plan:** the release workflow pushes `Formula/vili.rb` to a
+> `R-zin/homebrew-tap` repository when the `HOMEBREW_TAP_GITHUB_TOKEN` secret is
+> configured. The committed `Formula/vili.rb` is the canonical reference until then
+> (its `sha256` is filled from the release `checksums.txt`).
 
 ## Testing
 
@@ -240,17 +327,20 @@ Current green gate for CI: `go build ./...`, `go vet ./...`, `gofmt -l .` empty,
 - [x] **Phase 2 (backend side)** — rooms, membership, message persistence + message APIs
 - [x] **Phase 3** — CLI client: login/session persistence, room browsing, message send, interactive chat view (poll-based)
 - [x] **Phase 4** — real-time messaging (WebSocket), presence, typing indicators; live CLI chat view
-- [ ] **Phase 5** — production hardening, observability, rate limiting, deployment, **Homebrew distribution**
+- [x] **Phase 5** — production hardening (security headers, body caps, panic recovery, deny-by-default CORS), observability (access logs, `/metrics`, gated pprof), rate limiting (per-IP/per-user token buckets + a WS connection cap), Docker/fly deployment, **Homebrew distribution**
 
 ## Built with
 
 Go 1.26 · `net/http` (ServeMux) · `github.com/jackc/pgx/v5` (stdlib `database/sql`) ·
 `github.com/golang-jwt/jwt/v5` · `golang.org/x/crypto/bcrypt` ·
-`github.com/coder/websocket` (real-time) · PostgreSQL.
+`github.com/coder/websocket` (real-time) · `golang.org/x/time/rate` (rate limiting) · PostgreSQL.
 
 > **Dependency note:** the original Phase-1 whitelist excluded a websocket library
 > because real-time was out of scope then. Phase 4 adds `github.com/coder/websocket`
-> (the maintained `nhooyr.io/websocket` successor) — a deliberate, minimal addition.
+> (the maintained `nhooyr.io/websocket` successor). Phase 5 adds
+> `golang.org/x/time/rate` — the stdlib-adjacent token bucket — for rate limiting and
+> nothing else (the Prometheus registry is hand-rolled), keeping the dependency
+> surface deliberately small.
 
 ---
 
