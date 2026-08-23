@@ -13,6 +13,11 @@ func clearEnv(t *testing.T) {
 		"HTTP_READ_TIMEOUT", "HTTP_READ_HEADER_TIMEOUT", "HTTP_WRITE_TIMEOUT",
 		"HTTP_IDLE_TIMEOUT", "SHUTDOWN_TIMEOUT",
 		"DB_MAX_OPEN_CONNS", "DB_MAX_IDLE_CONNS", "DB_CONN_MAX_LIFETIME",
+		"MAX_BODY_BYTES", "SECURITY_HEADERS_ENABLED", "CORS_ALLOWED_ORIGINS",
+		"RATE_LIMIT_ENABLED", "RATE_LIMIT_AUTH_RPS", "RATE_LIMIT_AUTH_BURST",
+		"RATE_LIMIT_MESSAGES_RPS", "RATE_LIMIT_MESSAGES_BURST",
+		"WS_MAX_CONNS_PER_USER",
+		"REQUEST_LOG_ENABLED", "METRICS_ENABLED", "PPROF_ENABLED",
 	} {
 		t.Setenv(k, "")
 	}
@@ -119,5 +124,109 @@ func TestLoad_NonPositiveExpiry(t *testing.T) {
 	t.Setenv("JWT_EXPIRY_MINUTES", "0")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for non-positive JWT_EXPIRY_MINUTES")
+	}
+}
+
+func TestLoad_Phase5Defaults(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("JWT_SECRET", "secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Security.MaxBodyBytes != 1<<20 {
+		t.Errorf("MaxBodyBytes = %d, want 1 MiB", cfg.Security.MaxBodyBytes)
+	}
+	if !cfg.Security.HeadersEnabled {
+		t.Error("expected security headers on by default")
+	}
+	if cfg.Security.CORSAllowedOrigins != nil {
+		t.Errorf("expected deny-by-default CORS (nil), got %v", cfg.Security.CORSAllowedOrigins)
+	}
+	if !cfg.RateLimit.Enabled {
+		t.Error("expected rate limiting on by default")
+	}
+	if cfg.RateLimit.AuthRPS != 5 || cfg.RateLimit.AuthBurst != 10 {
+		t.Errorf("auth limit = %v/%d", cfg.RateLimit.AuthRPS, cfg.RateLimit.AuthBurst)
+	}
+	if cfg.RateLimit.MessagesRPS != 10 || cfg.RateLimit.MessagesBurst != 20 {
+		t.Errorf("messages limit = %v/%d", cfg.RateLimit.MessagesRPS, cfg.RateLimit.MessagesBurst)
+	}
+	if cfg.WS.MaxConnsPerUser != 5 {
+		t.Errorf("MaxConnsPerUser = %d, want 5", cfg.WS.MaxConnsPerUser)
+	}
+	if !cfg.Observability.RequestLogEnabled || !cfg.Observability.MetricsEnabled {
+		t.Errorf("expected request-log and metrics on by default, got %+v", cfg.Observability)
+	}
+	if cfg.Observability.PprofEnabled {
+		t.Error("expected pprof off by default")
+	}
+}
+
+func TestLoad_CORSAllowlist(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("CORS_ALLOWED_ORIGINS", "https://app.example.com, https://admin.example.com ,")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"https://app.example.com", "https://admin.example.com"}
+	if len(cfg.Security.CORSAllowedOrigins) != len(want) {
+		t.Fatalf("CORSAllowedOrigins = %v, want %v", cfg.Security.CORSAllowedOrigins, want)
+	}
+	for i := range want {
+		if cfg.Security.CORSAllowedOrigins[i] != want[i] {
+			t.Errorf("origin[%d] = %q, want %q", i, cfg.Security.CORSAllowedOrigins[i], want[i])
+		}
+	}
+}
+
+func TestLoad_InvalidPhase5Values(t *testing.T) {
+	cases := []struct {
+		name, key, val string
+	}{
+		{"max body not int", "MAX_BODY_BYTES", "huge"},
+		{"max body negative", "MAX_BODY_BYTES", "-1"},
+		{"auth rps not float", "RATE_LIMIT_AUTH_RPS", "lots"},
+		{"auth burst not int", "RATE_LIMIT_AUTH_BURST", "x"},
+		{"messages rps negative", "RATE_LIMIT_MESSAGES_RPS", "-2"},
+		{"ws conns not int", "WS_MAX_CONNS_PER_USER", "many"},
+		{"ws conns zero", "WS_MAX_CONNS_PER_USER", "0"},
+		{"headers not bool", "SECURITY_HEADERS_ENABLED", "maybe"},
+		{"rate enabled not bool", "RATE_LIMIT_ENABLED", "sure"},
+		{"request log not bool", "REQUEST_LOG_ENABLED", "yep"},
+		{"metrics not bool", "METRICS_ENABLED", "nope"},
+		{"pprof not bool", "PPROF_ENABLED", "yeah"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("DATABASE_URL", "postgres://localhost/db")
+			t.Setenv("JWT_SECRET", "secret")
+			t.Setenv(tc.key, tc.val)
+			if _, err := Load(); err == nil {
+				t.Fatalf("expected error for %s=%q", tc.key, tc.val)
+			}
+		})
+	}
+}
+
+func TestLoad_RateLimitDisabledSkipsValidation(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("RATE_LIMIT_ENABLED", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimit.Enabled {
+		t.Error("expected rate limiting disabled")
 	}
 }
