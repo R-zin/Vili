@@ -187,3 +187,30 @@ func TestPanicRecoveryThroughChain(t *testing.T) {
 		t.Errorf("envelope code = %q, want internal", body.Error.Code)
 	}
 }
+
+// TestBodyCapRejectsOversizedJSON verifies the router-level MaxBytesReader cap
+// fails an oversized JSON POST (here, a register request) instead of decoding
+// an unbounded body. The decoder surfaces a non-2xx error envelope.
+func TestBodyCapRejectsOversizedJSON(t *testing.T) {
+	tokens := newTestTokens(t)
+	mw := Middleware{
+		Chain: func(next http.Handler) http.Handler {
+			return httputil.Chain(next, httputil.MaxBodyBytes(64))
+		},
+	}
+	h := NewRouter(user.NewHandler(nil, tokens), nil, nil, nil, tokens, fakePinger{}, mw)
+
+	// A JSON body far larger than 64 bytes.
+	big := `{"username":"` + strings.Repeat("u", 256) + `","password":"supersecret"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/register", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
+		t.Fatalf("oversized body must not succeed, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec.Code != http.StatusBadRequest && rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 400 or 413 for an oversized body, got %d", rec.Code)
+	}
+}
