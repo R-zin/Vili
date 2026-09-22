@@ -38,6 +38,9 @@ func NewTokenService(secret []byte, expiry time.Duration) (*TokenService, error)
 	return &TokenService{secret: s, expiry: expiry}, nil
 }
 
+// Expiry returns the configured access-token lifetime.
+func (s *TokenService) Expiry() time.Duration { return s.expiry }
+
 // Issue mints a signed token whose subject is the given user id.
 func (s *TokenService) Issue(userID uuid.UUID) (string, error) {
 	now := time.Now()

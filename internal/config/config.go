@@ -17,6 +17,7 @@ import (
 const (
 	defaultPort             = 8080
 	defaultJWTExpiryMinutes = 60
+	defaultRefreshTokenTTL  = 30 * 24 * time.Hour // 30 days
 
 	defaultHTTPReadTimeout       = 15 * time.Second
 	defaultHTTPReadHeaderTimeout = 5 * time.Second
@@ -115,8 +116,11 @@ type Config struct {
 	DatabaseURL string
 	// JWTSecret signs HS256 tokens (required, never empty).
 	JWTSecret []byte
-	// JWTExpiry is how long an issued token remains valid.
+	// JWTExpiry is how long an issued access token remains valid.
 	JWTExpiry time.Duration
+	// RefreshTokenTTL is how long a refresh token remains valid before it must
+	// be rotated or the user re-logs in.
+	RefreshTokenTTL time.Duration
 
 	HTTP          HTTP
 	DB            DB
@@ -155,6 +159,13 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: JWT_EXPIRY_MINUTES must be positive, got %d", expiryMinutes)
 	}
 	cfg.JWTExpiry = time.Duration(expiryMinutes) * time.Minute
+
+	if cfg.RefreshTokenTTL, err = durationEnv("REFRESH_TOKEN_TTL", defaultRefreshTokenTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.RefreshTokenTTL <= 0 {
+		return Config{}, fmt.Errorf("config: REFRESH_TOKEN_TTL must be positive, got %s", cfg.RefreshTokenTTL)
+	}
 
 	if cfg.HTTP.ReadTimeout, err = durationEnv("HTTP_READ_TIMEOUT", defaultHTTPReadTimeout); err != nil {
 		return Config{}, err

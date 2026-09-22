@@ -72,7 +72,7 @@ func run() error {
 	mw, stop := buildMiddleware(cfg)
 	defer stop()
 	handler := api.NewRouter(
-		user.NewHandler(userRepo, tokens),
+		user.NewHandler(userRepo, tokens, userRepo, cfg.RefreshTokenTTL),
 		room.NewHandler(room.NewPostgresRepository(db)),
 		message.NewHandler(messageRepo, hub),
 		ws.NewHandler(hub, messageRepo, userRepo),

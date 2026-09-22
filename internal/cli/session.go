@@ -7,14 +7,20 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
-// Session is the persisted client state: which server to talk to and the
-// bearer token + identity from the last login.
+// Session is the persisted client state: which server to talk to, the bearer
+// token + its expiry, the refresh token used to renew it, and the identity from
+// the last login. RefreshToken and TokenExpiry are zero for sessions saved
+// before refresh tokens existed; such sessions simply require a fresh login
+// once the access token expires.
 type Session struct {
-	BaseURL string `json:"base_url"`
-	Token   string `json:"token"`
-	User    User   `json:"user"`
+	BaseURL      string    `json:"base_url"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
+	TokenExpiry  time.Time `json:"token_expiry,omitempty"`
+	User         User      `json:"user"`
 }
 
 // ErrNoSession reports that no session file exists yet (i.e. not logged in).
