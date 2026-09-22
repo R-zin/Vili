@@ -89,6 +89,16 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 		baseURL = *server
 	}
 	client := NewClient(baseURL, sessionToken(sess, *tokenOverride))
+	// Wire silent renewal: when the access token nears expiry, the client
+	// rotates it with the stored refresh token and persists the new pair.
+	if sess != nil && *tokenOverride == "" {
+		client.RefreshToken = sess.RefreshToken
+		client.TokenExpiry = sess.TokenExpiry
+		client.OnTokenRefresh = func(access, refresh string, expiry time.Time) {
+			sess.Token, sess.RefreshToken, sess.TokenExpiry = access, refresh, expiry
+			_ = sess.Save() // best-effort; a lost save just forces re-login next time
+		}
+	}
 
 	switch cmd {
 	case "register":
@@ -96,7 +106,7 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 	case "login":
 		return cmdLogin(ctx, out, client, baseURL, cmdArgs)
 	case "logout":
-		return cmdLogout(out)
+		return cmdLogout(ctx, out, client)
 	case "rooms":
 		return cmdRooms(ctx, out, client)
 	case "create":
@@ -167,19 +177,28 @@ func cmdLogin(ctx context.Context, out io.Writer, c *Client, baseURL string, arg
 	if err := requireArgs(args, 2, "login <username> <password>"); err != nil {
 		return err
 	}
-	token, u, err := c.Login(ctx, args[0], args[1])
+	resp, err := c.Login(ctx, args[0], args[1])
 	if err != nil {
 		return err
 	}
-	sess := &Session{BaseURL: baseURL, Token: token, User: u}
+	sess := &Session{
+		BaseURL:      baseURL,
+		Token:        resp.Token,
+		RefreshToken: resp.RefreshToken,
+		TokenExpiry:  resp.ExpiresAt,
+		User:         resp.User,
+	}
 	if err := sess.Save(); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "logged in as %s — session saved\n", u.Username)
+	fmt.Fprintf(out, "logged in as %s — session saved\n", resp.User.Username)
 	return nil
 }
 
-func cmdLogout(out io.Writer) error {
+func cmdLogout(ctx context.Context, out io.Writer, c *Client) error {
+	// Best-effort server-side revocation so the refresh token can't be reused
+	// after the session file is gone; a network failure must not block logout.
+	_ = c.Logout(ctx)
 	if err := ClearSession(); err != nil {
 		return err
 	}

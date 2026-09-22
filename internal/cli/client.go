@@ -4,13 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
+
+// renewSkew is how long before the access token's expiry the client renews it
+// proactively, so an in-flight command never races an expiring token.
+const renewSkew = 30 * time.Second
 
 // Client is a thin HTTP consumer of the Vili backend API. It carries the
 // bearer token from the session and decodes the server's uniform error
@@ -20,8 +26,20 @@ type Client struct {
 	BaseURL string
 	// Token is the JWT from login; empty until authenticated.
 	Token string
+	// RefreshToken renews Token when it expires; empty disables silent renewal.
+	RefreshToken string
+	// TokenExpiry is when Token expires (from the login/refresh response).
+	TokenExpiry time.Time
+
+	// OnTokenRefresh is called after a successful silent renewal so the caller
+	// can persist the rotated token pair. Nil disables silent renewal.
+	OnTokenRefresh func(access, refresh string, expiry time.Time)
 
 	http *http.Client
+	// renewMu serializes token renewal so a chat view and a send that both hit
+	// a 401 (or an expired token) rotate only once, not twice — a double
+	// rotation would trip the server's reuse detection and force a logout.
+	renewMu sync.Mutex
 }
 
 // NewClient builds a Client with a sane request timeout.
@@ -45,8 +63,34 @@ func (e *Error) Error() string { return e.Message }
 
 // do performs one JSON request and decodes the body into out (when out is
 // non-nil). A non-2xx response is decoded from the uniform error envelope and
-// returned as *Error.
+// returned as *Error. When the access token is expired (or about to be) and a
+// refresh token is available, do renews it first; a single 401 also triggers
+// one renew-and-retry, so a token that expired mid-session is transparently
+// refreshed rather than surfacing a spurious auth error.
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
+	if err := c.ensureFreshToken(ctx); err != nil {
+		return err
+	}
+	if err := c.doOnce(ctx, method, path, query, body, out); err != nil {
+		var apiErr *Error
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized {
+			return err
+		}
+		// The token was rejected even though it isn't near expiry (or is): renew
+		// once, then replay. A failed renewal means the session is dead.
+		if !c.canRefresh() {
+			return err
+		}
+		if rerr := c.renewIfStale(ctx, c.Token); rerr != nil {
+			return rerr
+		}
+		return c.doOnce(ctx, method, path, query, body, out)
+	}
+	return nil
+}
+
+// doOnce performs a single request attempt with the client's current token.
+func (c *Client) doOnce(ctx context.Context, method, path string, query url.Values, body, out any) error {
 	u := c.BaseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -97,6 +141,57 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	return nil
 }
 
+// ensureFreshToken proactively renews the access token when it is expired or
+// within the renew skew window, provided a refresh token and callback are
+// configured.
+func (c *Client) ensureFreshToken(ctx context.Context) error {
+	if !c.canRefresh() || time.Now().Add(renewSkew).Before(c.TokenExpiry) {
+		return nil
+	}
+	return c.renewIfStale(ctx, c.Token)
+}
+
+// canRefresh reports whether silent renewal is configured.
+func (c *Client) canRefresh() bool {
+	return c.RefreshToken != "" && c.OnTokenRefresh != nil
+}
+
+// renewIfStale exchanges the refresh token for a new access+refresh pair,
+// single-flight. staleToken is the access token the caller was about to use (or
+// that was just rejected): if another goroutine already renewed while we waited
+// on the mutex, the current Token differs and we skip the redundant rotation —
+// two rotations would trip the server's reuse detection and force a logout. A
+// refresh rejected by the server means the session is dead and the user must
+// log in again.
+func (c *Client) renewIfStale(ctx context.Context, staleToken string) error {
+	c.renewMu.Lock()
+	defer c.renewMu.Unlock()
+
+	if c.Token != staleToken {
+		return nil // someone already renewed
+	}
+
+	var resp loginResponse
+	err := c.doOnce(ctx, http.MethodPost, "/v1/auth/refresh", nil,
+		map[string]string{"refresh_token": c.RefreshToken}, &resp)
+	if err != nil {
+		return fmt.Errorf("session expired — run: vili login (%w)", err)
+	}
+	c.applySession(resp)
+	return nil
+}
+
+// applySession stores a fresh token pair on the client and persists it via the
+// callback.
+func (c *Client) applySession(resp loginResponse) {
+	c.Token = resp.Token
+	c.RefreshToken = resp.RefreshToken
+	c.TokenExpiry = resp.ExpiresAt
+	if c.OnTokenRefresh != nil {
+		c.OnTokenRefresh(resp.Token, resp.RefreshToken, resp.ExpiresAt)
+	}
+}
+
 // credentials is the shared register/login request body.
 type credentials struct {
 	Username string `json:"username"`
@@ -110,11 +205,23 @@ func (c *Client) Register(ctx context.Context, username, password string) (User,
 	return u, err
 }
 
-// Login authenticates and returns the token and user.
-func (c *Client) Login(ctx context.Context, username, password string) (string, User, error) {
+// Login authenticates and returns the full session payload (access token,
+// refresh token, expiry, and user). It bypasses renewal since the caller is
+// unauthenticated.
+func (c *Client) Login(ctx context.Context, username, password string) (loginResponse, error) {
 	var resp loginResponse
-	err := c.do(ctx, http.MethodPost, "/v1/auth/login", nil, credentials{username, password}, &resp)
-	return resp.Token, resp.User, err
+	err := c.doOnce(ctx, http.MethodPost, "/v1/auth/login", nil, credentials{username, password}, &resp)
+	return resp, err
+}
+
+// Logout revokes the refresh token server-side (best-effort) so the session
+// cannot be renewed after the local session file is cleared.
+func (c *Client) Logout(ctx context.Context) error {
+	if c.RefreshToken == "" {
+		return nil
+	}
+	return c.doOnce(ctx, http.MethodPost, "/v1/auth/logout", nil,
+		map[string]string{"refresh_token": c.RefreshToken}, nil)
 }
 
 // CreateRoom creates a room owned by the authenticated user.

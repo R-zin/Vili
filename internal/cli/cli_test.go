@@ -39,8 +39,10 @@ func (f *fakeAPI) handler() http.Handler {
 	mux.HandleFunc("POST /v1/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		capture(w, r)
 		_ = json.NewEncoder(w).Encode(loginResponse{
-			Token: "tok-123",
-			User:  User{ID: "u1", Username: "dev"},
+			Token:        "tok-123",
+			RefreshToken: "refresh-abc",
+			ExpiresAt:    time.Now().Add(time.Hour),
+			User:         User{ID: "u1", Username: "dev"},
 		})
 	})
 	mux.HandleFunc("POST /v1/rooms/{id}/messages", func(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +58,10 @@ func (f *fakeAPI) handler() http.Handler {
 		capture(w, r)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(Room{ID: "r1", Name: f.lastBody["name"]})
+	})
+	mux.HandleFunc("POST /v1/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		capture(w, r)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "logged_out"})
 	})
 	return mux
 }
@@ -94,6 +100,12 @@ func TestLoginSavesSession(t *testing.T) {
 	}
 	if sess.Token != "tok-123" {
 		t.Fatalf("expected saved token tok-123, got %q", sess.Token)
+	}
+	if sess.RefreshToken != "refresh-abc" {
+		t.Fatalf("expected saved refresh token refresh-abc, got %q", sess.RefreshToken)
+	}
+	if sess.TokenExpiry.IsZero() {
+		t.Fatal("expected a saved token expiry")
 	}
 	if sess.User.Username != "dev" {
 		t.Fatalf("expected saved username dev, got %q", sess.User.Username)
@@ -173,6 +185,143 @@ func TestVersionCommand(t *testing.T) {
 	got := strings.TrimSpace(out.String())
 	if got != "vili "+Version() {
 		t.Fatalf("version output = %q, want %q", got, "vili "+Version())
+	}
+}
+
+func TestLogoutCallsServerAndClearsSession(t *testing.T) {
+	isolateConfig(t)
+	srv, api := newFakeServer(t)
+
+	if err := (&Session{
+		BaseURL:      srv.URL,
+		Token:        "sess-tok",
+		RefreshToken: "refresh-xyz",
+		User:         User{Username: "dev"},
+	}).Save(); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := Run(context.Background(), &out, strings.NewReader(""), []string{"--server", srv.URL, "logout"}); err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+
+	// The server endpoint must be hit with the stored refresh token as the body.
+	if api.lastPath != "/v1/auth/logout" || api.lastMethod != http.MethodPost {
+		t.Fatalf("expected POST /v1/auth/logout, got %s %s", api.lastMethod, api.lastPath)
+	}
+	if api.lastBody["refresh_token"] != "refresh-xyz" {
+		t.Fatalf("expected the refresh token in the logout body, got %q", api.lastBody["refresh_token"])
+	}
+	// The session file must be cleared afterwards.
+	if _, err := LoadSession(); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("expected session cleared after logout, got err=%v", err)
+	}
+}
+
+func TestDoRefreshesOn401ThenRetries(t *testing.T) {
+	var refreshes, attempts int
+	var retriedAuth string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/refresh":
+			refreshes++
+			_ = json.NewEncoder(w).Encode(loginResponse{
+				Token:        "tok-new",
+				RefreshToken: "refresh-new",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			})
+		case "/v1/rooms/r1/messages":
+			attempts++
+			retriedAuth = r.Header.Get("Authorization")
+			if attempts == 1 {
+				// First attempt: stale access token is rejected.
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]any{"code": "unauthorized", "message": "expired", "status": 401},
+				})
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(Message{ID: "m1"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewClient(srv.URL, "tok-stale")
+	client.RefreshToken = "refresh-old"
+	// Not near expiry, so the proactive path stays out of the way and only the
+	// 401 -> renew -> retry path runs.
+	client.TokenExpiry = time.Now().Add(time.Hour)
+	var persisted string
+	client.OnTokenRefresh = func(access, refresh string, expiry time.Time) { persisted = access }
+
+	m, err := client.SendMessage(context.Background(), "r1", "hello", "")
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if m.ID != "m1" {
+		t.Fatalf("expected the retried request to succeed, got %+v", m)
+	}
+	if refreshes != 1 {
+		t.Fatalf("expected exactly one refresh, got %d", refreshes)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected the original request to be retried once, got %d attempts", attempts)
+	}
+	if retriedAuth != "Bearer tok-new" {
+		t.Fatalf("expected the retry to use the refreshed token, got %q", retriedAuth)
+	}
+	if persisted != "tok-new" {
+		t.Fatalf("expected OnTokenRefresh to persist tok-new, got %q", persisted)
+	}
+}
+
+func TestDoProactiveRefreshBeforeExpiry(t *testing.T) {
+	var refreshes, attempts int
+	var usedAuth string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/refresh":
+			refreshes++
+			_ = json.NewEncoder(w).Encode(loginResponse{
+				Token:        "tok-fresh",
+				RefreshToken: "refresh-fresh",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			})
+		case "/v1/listrooms":
+			attempts++
+			usedAuth = r.Header.Get("Authorization")
+			_ = json.NewEncoder(w).Encode([]Room{})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewClient(srv.URL, "tok-old")
+	client.RefreshToken = "refresh-old"
+	// Within the 30s skew window -> proactive renewal before the request.
+	client.TokenExpiry = time.Now().Add(10 * time.Second)
+	client.OnTokenRefresh = func(access, refresh string, expiry time.Time) {}
+
+	if _, err := client.ListRooms(context.Background()); err != nil {
+		t.Fatalf("ListRooms: %v", err)
+	}
+	if refreshes != 1 {
+		t.Fatalf("expected one proactive refresh, got %d", refreshes)
+	}
+	if attempts != 1 {
+		t.Fatalf("expected a single (non-retried) request, got %d", attempts)
+	}
+	if usedAuth != "Bearer tok-fresh" {
+		t.Fatalf("expected the request to use the refreshed token, got %q", usedAuth)
 	}
 }
 
