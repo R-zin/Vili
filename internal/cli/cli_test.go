@@ -355,3 +355,26 @@ func mustTime(t *testing.T, s string) time.Time {
 	}
 	return parsed
 }
+
+func TestSanitizeTerminal(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"plain text", "hello world", "hello world"},
+		{"with tabs and newlines", "hello\tworld\nsecond line", "hello\tworld\nsecond line"},
+		{"strips ansi color", "\x1b[31mred\x1b[0m normal", "red normal"},
+		{"strips screen clear", "\x1b[2J\x1b[Hmalicious prompt", "malicious prompt"},
+		{"strips osc 52 clipboard injection", "\x1b]52;c;payload\x07text", "text"},
+		{"strips raw bell and control chars", "bell\x07\x00\x1ftext", "belltext"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeTerminal(tc.input)
+			if got != tc.expected {
+				t.Errorf("sanitizeTerminal(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}

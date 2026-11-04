@@ -145,6 +145,9 @@ func Load() (Config, error) {
 	if !ok || secret == "" {
 		return Config{}, fmt.Errorf("config: JWT_SECRET is required and must not be empty")
 	}
+	if len(secret) < 32 {
+		return Config{}, fmt.Errorf("config: JWT_SECRET must be at least 32 bytes (256 bits), got %d", len(secret))
+	}
 	cfg.JWTSecret = []byte(secret)
 
 	var err error

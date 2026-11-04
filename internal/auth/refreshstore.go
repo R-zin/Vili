@@ -12,6 +12,10 @@ import (
 // digest. Mapped to 401 by the caller.
 var ErrRefreshNotFound = errors.New("auth: refresh token not found")
 
+// ErrRefreshAlreadyConsumed reports that a token was already consumed when attempting
+// an atomic rotation. Mapped to reuse detection (revoking family) by the caller.
+var ErrRefreshAlreadyConsumed = errors.New("auth: refresh token already consumed")
+
 // RefreshToken is one stored refresh-token row (the digest itself is never
 // exposed). Consumed marks a token that has already been rotated; presenting a
 // consumed token indicates theft and triggers family revocation.

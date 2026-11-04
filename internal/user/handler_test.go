@@ -105,8 +105,12 @@ func (s *fakeRefreshStore) ConsumeRefreshToken(ctx context.Context, id, replaced
 	}
 	for h, t := range s.byHash {
 		if t.ID == id {
+			if t.Consumed {
+				return auth.ErrRefreshAlreadyConsumed
+			}
 			t.Consumed = true
 			s.byHash[h] = t
+			return nil
 		}
 	}
 	return nil
@@ -151,7 +155,7 @@ func newTestHandler(t *testing.T, repo Repository) *Handler {
 
 func newTestHandlerWithStore(t *testing.T, repo Repository, store auth.RefreshStore) *Handler {
 	t.Helper()
-	tokens, err := auth.NewTokenService([]byte("test-secret-for-user-handler"), time.Hour)
+	tokens, err := auth.NewTokenService([]byte("test-secret-for-user-handler-32b!"), time.Hour)
 	if err != nil {
 		t.Fatalf("NewTokenService: %v", err)
 	}
@@ -235,6 +239,9 @@ func TestRegister_Validation(t *testing.T) {
 		{"long username", `{"username":"` + strings.Repeat("a", 65) + `","password":"password123"}`},
 		{"short password", `{"username":"bob","password":"short"}`},
 		{"empty password", `{"username":"bob","password":""}`},
+		{"password over 72 bytes", `{"username":"bob","password":"` + strings.Repeat("p", 73) + `"}`},
+		{"username with escape sequence", `{"username":"bob` + "\x1b" + `[31m","password":"password123"}`},
+		{"username with newline", `{"username":"bob` + "\n" + `admin","password":"password123"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -404,6 +411,28 @@ func TestRefresh_ReuseRevokesFamily(t *testing.T) {
 	}
 	if len(store.familyRevoked) != 1 || store.familyRevoked[0] != family {
 		t.Fatalf("expected family %v revoked, got %v", family, store.familyRevoked)
+	}
+}
+
+func TestRefresh_ConcurrentConsumeRaceRevokesFamily(t *testing.T) {
+	repo := newFakeRepo()
+	store := newFakeRefreshStore()
+	h := newTestHandlerWithStore(t, repo, store)
+	u := registerUser(t, h, "fred")
+	family := uuid.New()
+
+	raw, _, _ := store.seed(t, u.ID, family, false, time.Hour)
+	store.consumeErr = auth.ErrRefreshAlreadyConsumed
+
+	rec := doRequest(t, h.refreshHandler, `{"refresh_token":"`+raw+`"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for concurrent race reuse, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "refresh token reuse detected") {
+		t.Fatalf("expected reuse detected message, got %s", rec.Body.String())
+	}
+	if len(store.familyRevoked) != 1 || store.familyRevoked[0] != family {
+		t.Fatalf("expected family %v revoked on race, got %v", family, store.familyRevoked)
 	}
 }
 

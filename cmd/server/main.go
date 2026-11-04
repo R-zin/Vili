@@ -75,7 +75,7 @@ func run() error {
 		user.NewHandler(userRepo, tokens, userRepo, cfg.RefreshTokenTTL),
 		room.NewHandler(room.NewPostgresRepository(db)),
 		message.NewHandler(messageRepo, hub),
-		ws.NewHandler(hub, messageRepo, userRepo),
+		ws.NewHandler(hub, messageRepo, userRepo, cfg.Security.CORSAllowedOrigins...),
 		tokens,
 		db,
 		mw,

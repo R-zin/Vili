@@ -62,16 +62,45 @@ func (s *Session) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode session: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("write session: %w", err)
+
+	// Atomic write: create a temporary file in the same directory, sync, chmod, and rename.
+	tmpFile, err := os.CreateTemp(dir, "session-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp session: %w", err)
 	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("chmod temp session: %w", err)
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("write temp session: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("sync temp session: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp session: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename session: %w", err)
+	}
+	_ = os.Chmod(path, 0o600)
 	return nil
 }
 

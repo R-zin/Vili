@@ -22,7 +22,7 @@ func (f fakePinger) PingContext(ctx context.Context) error { return f.err }
 
 func newTestTokens(t *testing.T) *auth.TokenService {
 	t.Helper()
-	tokens, err := auth.NewTokenService([]byte("api-test-secret"), time.Hour)
+	tokens, err := auth.NewTokenService([]byte("api-test-secret-at-least-32-bytes!"), time.Hour)
 	if err != nil {
 		t.Fatalf("NewTokenService: %v", err)
 	}

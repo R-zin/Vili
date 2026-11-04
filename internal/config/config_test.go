@@ -42,7 +42,7 @@ func TestLoad_RequiresJWTSecret(t *testing.T) {
 func TestLoad_Defaults(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", "postgres://localhost/db")
-	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 
 	cfg, err := Load()
 	if err != nil {
@@ -57,7 +57,7 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.DatabaseURL != "postgres://localhost/db" {
 		t.Errorf("DatabaseURL = %q", cfg.DatabaseURL)
 	}
-	if string(cfg.JWTSecret) != "secret" {
+	if string(cfg.JWTSecret) != "super-secret-key-that-is-at-least-32-bytes-long" {
 		t.Errorf("JWTSecret mismatch")
 	}
 	if cfg.HTTP.ReadTimeout == 0 || cfg.HTTP.WriteTimeout == 0 ||
@@ -70,10 +70,20 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 }
 
+func TestLoad_ShortJWTSecret(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("JWT_SECRET", "short-secret")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected short JWT_SECRET to be refused")
+	}
+}
+
 func TestLoad_Overrides(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", "postgres://localhost/db")
-	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 	t.Setenv("PORT", "9090")
 	t.Setenv("JWT_EXPIRY_MINUTES", "5")
 	t.Setenv("HTTP_READ_TIMEOUT", "1s")
@@ -100,7 +110,7 @@ func TestLoad_Overrides(t *testing.T) {
 func TestLoad_InvalidNumeric(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", "postgres://localhost/db")
-	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 	t.Setenv("PORT", "not-a-number")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for non-integer PORT")
@@ -110,7 +120,7 @@ func TestLoad_InvalidNumeric(t *testing.T) {
 func TestLoad_InvalidDuration(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", "postgres://localhost/db")
-	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 	t.Setenv("HTTP_READ_TIMEOUT", "not-a-duration")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for non-duration HTTP_READ_TIMEOUT")
@@ -120,7 +130,7 @@ func TestLoad_InvalidDuration(t *testing.T) {
 func TestLoad_NonPositiveExpiry(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", "postgres://localhost/db")
-	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 	t.Setenv("JWT_EXPIRY_MINUTES", "0")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for non-positive JWT_EXPIRY_MINUTES")
@@ -130,7 +140,7 @@ func TestLoad_NonPositiveExpiry(t *testing.T) {
 func TestLoad_Phase5Defaults(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", "postgres://localhost/db")
-	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 
 	cfg, err := Load()
 	if err != nil {
@@ -168,7 +178,7 @@ func TestLoad_Phase5Defaults(t *testing.T) {
 func TestLoad_CORSAllowlist(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", "postgres://localhost/db")
-	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 	t.Setenv("CORS_ALLOWED_ORIGINS", "https://app.example.com, https://admin.example.com ,")
 
 	cfg, err := Load()
@@ -207,7 +217,7 @@ func TestLoad_InvalidPhase5Values(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clearEnv(t)
 			t.Setenv("DATABASE_URL", "postgres://localhost/db")
-			t.Setenv("JWT_SECRET", "secret")
+			t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 			t.Setenv(tc.key, tc.val)
 			if _, err := Load(); err == nil {
 				t.Fatalf("expected error for %s=%q", tc.key, tc.val)
@@ -219,7 +229,7 @@ func TestLoad_InvalidPhase5Values(t *testing.T) {
 func TestLoad_RateLimitDisabledSkipsValidation(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", "postgres://localhost/db")
-	t.Setenv("JWT_SECRET", "secret")
+	t.Setenv("JWT_SECRET", "super-secret-key-that-is-at-least-32-bytes-long")
 	t.Setenv("RATE_LIMIT_ENABLED", "false")
 
 	cfg, err := Load()

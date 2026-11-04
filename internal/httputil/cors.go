@@ -45,6 +45,7 @@ func CORS(allowed []string) func(http.Handler) http.Handler {
 
 			h := w.Header()
 			h.Set("Access-Control-Allow-Origin", origin)
+			h.Set("Access-Control-Expose-Headers", "Retry-After")
 			h.Add("Vary", "Access-Control-Request-Method")
 			h.Add("Vary", "Access-Control-Request-Headers")
 

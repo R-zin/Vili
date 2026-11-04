@@ -11,7 +11,7 @@ import (
 
 func requireWS(t *testing.T, next http.HandlerFunc) http.Handler {
 	t.Helper()
-	tokens, err := NewTokenService([]byte("requirews-test-secret"), time.Hour)
+	tokens, err := NewTokenService([]byte("requirews-test-secret-at-least-32b!"), time.Hour)
 	if err != nil {
 		t.Fatalf("NewTokenService: %v", err)
 	}
@@ -19,7 +19,7 @@ func requireWS(t *testing.T, next http.HandlerFunc) http.Handler {
 }
 
 func TestRequireWS_HeaderStillWorks(t *testing.T) {
-	tokens, _ := NewTokenService([]byte("requirews-test-secret"), time.Hour)
+	tokens, _ := NewTokenService([]byte("requirews-test-secret-at-least-32b!"), time.Hour)
 	userID := uuid.New()
 	token, err := tokens.Issue(userID)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestRequireWS_HeaderStillWorks(t *testing.T) {
 }
 
 func TestRequireWS_QueryTokenAccepted(t *testing.T) {
-	tokens, _ := NewTokenService([]byte("requirews-test-secret"), time.Hour)
+	tokens, _ := NewTokenService([]byte("requirews-test-secret-at-least-32b!"), time.Hour)
 	userID := uuid.New()
 	token, err := tokens.Issue(userID)
 	if err != nil {
@@ -62,7 +62,7 @@ func TestRequireWS_QueryTokenAccepted(t *testing.T) {
 }
 
 func TestRequireWS_HeaderPrecedenceOverQuery(t *testing.T) {
-	tokens, _ := NewTokenService([]byte("requirews-test-secret"), time.Hour)
+	tokens, _ := NewTokenService([]byte("requirews-test-secret-at-least-32b!"), time.Hour)
 	headerID, queryID := uuid.New(), uuid.New()
 	headerTok, _ := tokens.Issue(headerID)
 	queryTok, _ := tokens.Issue(queryID)

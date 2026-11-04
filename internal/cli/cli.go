@@ -310,9 +310,84 @@ func cmdSend(ctx context.Context, out io.Writer, c *Client, args []string) error
 	return nil
 }
 
-// printMessages writes messages oldest-first in a chat-like form.
+// printMessages writes messages oldest-first in a chat-like form,
+// sanitizing ANSI escape codes and control characters to prevent terminal injection.
 func printMessages(out io.Writer, messages []Message) {
 	for _, m := range messages {
-		fmt.Fprintf(out, "%s  %s: %s\n", m.CreatedAt.Local().Format("15:04:05"), m.Username, m.Content)
+		fmt.Fprintf(out, "%s  %s: %s\n",
+			m.CreatedAt.Local().Format("15:04:05"),
+			sanitizeTerminal(m.Username),
+			sanitizeTerminal(m.Content),
+		)
 	}
+}
+
+// sanitizeTerminal strips ANSI escape sequences and non-printable control characters
+// (except newline and tab) from untrusted user input before terminal rendering.
+func sanitizeTerminal(s string) string {
+	const (
+		stateNormal = iota
+		stateEscape
+		stateCSI
+		stateOSC
+		stateOSCEscape
+		stateCharset
+	)
+
+	var b strings.Builder
+	b.Grow(len(s))
+	state := stateNormal
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch state {
+		case stateNormal:
+			if c == 0x1b { // ESC
+				state = stateEscape
+			} else if c == '\n' || c == '\t' {
+				b.WriteByte(c)
+			} else if c < 32 || c == 127 {
+				// Strip raw ASCII control characters
+				continue
+			} else {
+				b.WriteByte(c)
+			}
+		case stateEscape:
+			switch c {
+			case '[':
+				state = stateCSI
+			case ']':
+				state = stateOSC
+			case '(', ')', '*', '+':
+				state = stateCharset
+			default:
+				// Single byte following ESC ends sequence (e.g., ESC c, ESC M)
+				state = stateNormal
+			}
+		case stateCSI:
+			// Final CSI byte is in range 0x40-0x7E (@ through ~)
+			if c >= 0x40 && c <= 0x7E {
+				state = stateNormal
+			}
+		case stateOSC:
+			if c == 0x07 { // BEL
+				state = stateNormal
+			} else if c == 0x1b {
+				state = stateOSCEscape
+			}
+		case stateOSCEscape:
+			if c == '\\' { // ST (String Terminator: ESC \)
+				state = stateNormal
+			} else if c == '[' {
+				state = stateCSI
+			} else if c == ']' {
+				state = stateOSC
+			} else {
+				state = stateNormal
+			}
+		case stateCharset:
+			state = stateNormal
+		}
+	}
+	return b.String()
 }

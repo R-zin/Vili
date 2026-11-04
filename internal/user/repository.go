@@ -131,15 +131,24 @@ func (r *PostgresRepository) RefreshTokenByHash(ctx context.Context, hash string
 }
 
 // ConsumeRefreshToken marks a token used and links it to its replacement.
+// It executes atomically and returns auth.ErrRefreshAlreadyConsumed if the
+// token was already consumed (e.g. concurrent race condition).
 func (r *PostgresRepository) ConsumeRefreshToken(ctx context.Context, id, replacedBy uuid.UUID) error {
-	_, err := r.db.ExecContext(ctx, `
+	res, err := r.db.ExecContext(ctx, `
 		UPDATE refresh_tokens
 		SET consumed_at = now(), replaced_by = $2
-		WHERE id = $1`,
+		WHERE id = $1 AND consumed_at IS NULL`,
 		id, replacedBy,
 	)
 	if err != nil {
 		return fmt.Errorf("user: consume refresh token: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("user: consume refresh token: %w", err)
+	}
+	if n == 0 {
+		return auth.ErrRefreshAlreadyConsumed
 	}
 	return nil
 }

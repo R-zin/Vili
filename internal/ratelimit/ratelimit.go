@@ -58,18 +58,51 @@ func New(rps float64, burst int) *Limiter {
 	return l
 }
 
+// maxBuckets bounds the total number of in-memory buckets to protect against
+// state-exhaustion OOM attacks from attackers rotating IP keys.
+const maxBuckets = 50000
+
 // Allow reports whether one request for key is permitted right now, consuming
 // a token if so.
 func (l *Limiter) Allow(key string) bool {
 	l.mu.Lock()
 	e, ok := l.buckets[key]
 	if !ok {
+		if len(l.buckets) >= maxBuckets {
+			l.evictOldestLocked()
+		}
 		e = &entry{lim: rate.NewLimiter(l.rps, l.burst)}
 		l.buckets[key] = e
 	}
 	e.last = l.now()
 	l.mu.Unlock()
 	return e.lim.Allow()
+}
+
+// evictOldestLocked frees bucket capacity when maxBuckets is reached.
+func (l *Limiter) evictOldestLocked() {
+	now := l.now()
+	for k, e := range l.buckets {
+		if now.Sub(e.last) > ttl {
+			delete(l.buckets, k)
+		}
+	}
+	if len(l.buckets) < maxBuckets {
+		return
+	}
+	// Still full: evict a batch of entries to prevent unbounded memory growth.
+	toRemove := maxBuckets / 10
+	if toRemove < 1 {
+		toRemove = 1
+	}
+	var count int
+	for k := range l.buckets {
+		delete(l.buckets, k)
+		count++
+		if count >= toRemove {
+			break
+		}
+	}
 }
 
 // RetryAfter is the suggested wait before the next request for key will be

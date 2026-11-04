@@ -124,17 +124,17 @@ func renderEvent(out io.Writer, e wsEvent) {
 	case eventTyping:
 		var p typingPayload
 		if err := json.Unmarshal(e.Payload, &p); err == nil && p.Username != "" {
-			fmt.Fprintf(out, "  · %s is typing…\n", p.Username)
+			fmt.Fprintf(out, "  · %s is typing…\n", sanitizeTerminal(p.Username))
 		}
 	case eventPresenceJoin:
 		var p presencePayload
 		if err := json.Unmarshal(e.Payload, &p); err == nil && p.Username != "" {
-			fmt.Fprintf(out, "  · %s joined\n", p.Username)
+			fmt.Fprintf(out, "  · %s joined\n", sanitizeTerminal(p.Username))
 		}
 	case eventPresenceLeave:
 		var p presencePayload
 		if err := json.Unmarshal(e.Payload, &p); err == nil && p.Username != "" {
-			fmt.Fprintf(out, "  · %s left\n", p.Username)
+			fmt.Fprintf(out, "  · %s left\n", sanitizeTerminal(p.Username))
 		}
 	case eventPresenceState:
 		var p presencePayload
@@ -142,7 +142,11 @@ func renderEvent(out io.Writer, e wsEvent) {
 			if len(p.Online) == 0 {
 				fmt.Fprintln(out, "  · you're the only one here")
 			} else {
-				fmt.Fprintf(out, "  · online: %s\n", strings.Join(p.Online, ", "))
+				var safeOnline []string
+				for _, user := range p.Online {
+					safeOnline = append(safeOnline, sanitizeTerminal(user))
+				}
+				fmt.Fprintf(out, "  · online: %s\n", strings.Join(safeOnline, ", "))
 			}
 		}
 	}

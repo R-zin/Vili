@@ -59,8 +59,8 @@ func NewRouter(
 ) http.Handler {
 	mux := http.NewServeMux()
 
-	// Public liveness: no database access.
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+	// Public liveness: exact root match (does not mask 404s for unmatched routes).
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		respond.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 

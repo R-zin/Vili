@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,7 +20,13 @@ const (
 	usernameMinLen = 1
 	usernameMaxLen = 64
 	passwordMinLen = 8
+	passwordMaxLen = 72 // Hard algorithmic truncation limit for bcrypt (OWASP A02)
 )
+
+// dummyBcryptHash is a precomputed bcrypt hash (cost 10) used during login
+// when an account is not found, equalizing execution timing to prevent
+// user enumeration side-channels.
+const dummyBcryptHash = "$2a$10$w09g1rL3zL9b5AiqYnO0geH01W6L2/L.8Bfqg7Y9P.0xH2b1zF.h6"
 
 // Handler serves the user feature's routes (register, login, refresh, logout).
 // It depends on the narrow Repository interface, a TokenService, and a refresh
@@ -119,7 +126,8 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	u, err := h.repo.ByUsername(r.Context(), req.Username)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			// Generic message: do not reveal whether the user exists.
+			// Equalize execution timing via dummy bcrypt comparison to neutralize user enumeration.
+			_ = auth.CompareHashAndPassword(dummyBcryptHash, req.Password)
 			respond.Error(w, http.StatusUnauthorized, "unauthorized", "invalid credentials")
 			return
 		}
@@ -200,6 +208,13 @@ func (h *Handler) refreshHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.refresh.ConsumeRefreshToken(r.Context(), rt.ID, newID); err != nil {
+		if errors.Is(err, auth.ErrRefreshAlreadyConsumed) {
+			// Concurrency race: token was already consumed by a concurrent request.
+			// Treat as theft/reuse and revoke entire family immediately.
+			_ = h.refresh.RevokeRefreshFamily(r.Context(), rt.FamilyID)
+			respond.Error(w, http.StatusUnauthorized, "unauthorized", "refresh token reuse detected")
+			return
+		}
 		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not refresh", err)
 		return
 	}
@@ -207,8 +222,9 @@ func (h *Handler) refreshHandler(w http.ResponseWriter, r *http.Request) {
 	respond.JSON(w, http.StatusOK, resp)
 }
 
-// logout revokes the presented refresh token. It is idempotent: an unknown
-// token still returns 200 so logout never leaks whether a token exists.
+// logout revokes the presented refresh token and its token family.
+// It is idempotent: an unknown token still returns 200 so logout never leaks
+// whether a token exists.
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	var req refreshRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -216,7 +232,11 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.RefreshToken != "" {
-		if err := h.refresh.RevokeRefreshToken(r.Context(), auth.HashRefresh(req.RefreshToken)); err != nil {
+		hash := auth.HashRefresh(req.RefreshToken)
+		if rt, err := h.refresh.RefreshTokenByHash(r.Context(), hash); err == nil {
+			_ = h.refresh.RevokeRefreshFamily(r.Context(), rt.FamilyID)
+		}
+		if err := h.refresh.RevokeRefreshToken(r.Context(), hash); err != nil {
 			respond.Errorf(w, http.StatusInternalServerError, "internal", "could not log out", err)
 			return
 		}
@@ -250,16 +270,22 @@ func (h *Handler) mintPair(ctx context.Context, u User, family uuid.UUID) (login
 	}, id, nil
 }
 
-// validateCredentials enforces username length and a minimum password length.
+// validateCredentials enforces username length, character safety, and password length bounds.
 func validateCredentials(username, password string, minPasswordLen int) error {
 	if len(username) < usernameMinLen || len(username) > usernameMaxLen {
 		return fmt.Errorf("username must be %d-%d characters", usernameMinLen, usernameMaxLen)
+	}
+	if strings.ContainsAny(username, "\r\n\t\x00\x1b") {
+		return fmt.Errorf("username must not contain control characters or escape sequences")
 	}
 	if len(password) < minPasswordLen {
 		if minPasswordLen <= 1 {
 			return fmt.Errorf("password must not be empty")
 		}
 		return fmt.Errorf("password must be at least %d characters", minPasswordLen)
+	}
+	if len(password) > passwordMaxLen {
+		return fmt.Errorf("password must be at most %d characters", passwordMaxLen)
 	}
 	return nil
 }
