@@ -23,7 +23,7 @@ import (
 // httputil's statusWriter via http.ResponseController/Unwrap, and that an
 // upgraded connection receives events end to end.
 func TestServeWS_ThroughMiddlewareChain(t *testing.T) {
-	tokens, err := auth.NewTokenService([]byte("phase5-ws-secret"), time.Hour)
+	tokens, err := auth.NewTokenService([]byte("phase5-ws-secret-at-least-32-bytes!"), time.Hour)
 	if err != nil {
 		t.Fatalf("NewTokenService: %v", err)
 	}

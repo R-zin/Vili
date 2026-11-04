@@ -83,9 +83,19 @@ func (c *Client) run(ctx context.Context) {
 	c.close(websocket.StatusNormalClosure, "closing")
 }
 
+// maxWebSocketFrameBytes bounds incoming frame size to protect against memory DoS.
+const maxWebSocketFrameBytes = 4096
+
+// minTypingInterval bounds the frequency of typing broadcasts per client to
+// neutralize typing-flood broadcast amplification attacks.
+const minTypingInterval = 1500 * time.Millisecond
+
 // readPump consumes client→server frames. Only typing events are honored;
 // anything else is ignored. It returns on read error or cancellation.
 func (c *Client) readPump(ctx context.Context) {
+	c.conn.SetReadLimit(maxWebSocketFrameBytes)
+	var lastTyping time.Time
+
 	for {
 		typ, data, err := c.conn.Read(ctx)
 		if err != nil {
@@ -99,6 +109,11 @@ func (c *Client) readPump(ctx context.Context) {
 			continue
 		}
 		if e.Type == event.Typing {
+			now := time.Now()
+			if now.Sub(lastTyping) < minTypingInterval {
+				continue // Throttle typing flood
+			}
+			lastTyping = now
 			c.hub.Broadcast(c.roomID, event.NewTyping(c.roomID, c.username))
 		}
 	}

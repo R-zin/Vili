@@ -22,7 +22,7 @@ func (f fakePinger) PingContext(ctx context.Context) error { return f.err }
 
 func newTestTokens(t *testing.T) *auth.TokenService {
 	t.Helper()
-	tokens, err := auth.NewTokenService([]byte("api-test-secret"), time.Hour)
+	tokens, err := auth.NewTokenService([]byte("api-test-secret-at-least-32-bytes!"), time.Hour)
 	if err != nil {
 		t.Fatalf("NewTokenService: %v", err)
 	}
@@ -34,7 +34,7 @@ func newRouter(t *testing.T, p Pinger) http.Handler {
 	t.Helper()
 	tokens := newTestTokens(t)
 	return NewRouter(
-		user.NewHandler(nil, tokens), // repo unused by health/ready/protected-no-token
+		user.NewHandler(nil, tokens, nil, 0), // repos unused by health/ready/protected-no-token
 		room.NewHandler(nil),
 		message.NewHandler(nil, nil),
 		nil, // realtime handler unused by these router tests

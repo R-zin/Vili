@@ -25,6 +25,8 @@ func TestSecurityHeaders(t *testing.T) {
 	hd := rec.Header()
 	for _, k := range []string{
 		"X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy", "Content-Security-Policy",
+		"Strict-Transport-Security", "Permissions-Policy", "Cross-Origin-Opener-Policy", "Cross-Origin-Resource-Policy",
+		"Cache-Control", "Pragma",
 	} {
 		if hd.Get(k) == "" {
 			t.Errorf("expected %s header to be set", k)
@@ -35,6 +37,9 @@ func TestSecurityHeaders(t *testing.T) {
 	}
 	if hd.Get("X-Frame-Options") != "DENY" {
 		t.Errorf("X-Frame-Options = %q", hd.Get("X-Frame-Options"))
+	}
+	if !strings.Contains(hd.Get("Strict-Transport-Security"), "max-age=") {
+		t.Errorf("Strict-Transport-Security = %q", hd.Get("Strict-Transport-Security"))
 	}
 }
 
@@ -161,6 +166,9 @@ func TestCORSAllowlistAndPreflight(t *testing.T) {
 	if rec.Header().Get("Access-Control-Allow-Origin") != "https://app.example.com" {
 		t.Errorf("expected reflected origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
 	}
+	if rec.Header().Get("Access-Control-Expose-Headers") != "Retry-After" {
+		t.Errorf("expected Retry-After in exposed headers, got %q", rec.Header().Get("Access-Control-Expose-Headers"))
+	}
 
 	// Allowed origin, preflight.
 	pre := httptest.NewRequest(http.MethodOptions, "/", nil)
@@ -228,6 +236,21 @@ func TestKeyByIP(t *testing.T) {
 	k2, _ := KeyByIP(r)
 	if k2 != "ip:203.0.113.7" {
 		t.Errorf("X-Forwarded-For must not change the key, got %q", k2)
+	}
+
+	// Fly-Client-IP is honored when present.
+	r.Header.Set("Fly-Client-IP", "198.51.100.42")
+	k3, _ := KeyByIP(r)
+	if k3 != "ip:198.51.100.42" {
+		t.Errorf("Fly-Client-IP expected, got %q", k3)
+	}
+
+	// IPv6 address is masked to /64 CIDR.
+	r6 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r6.RemoteAddr = "[2001:db8:85a3:8d3:1319:8a2e:370:7348]:1234"
+	k6, _ := KeyByIP(r6)
+	if k6 != "ip:2001:db8:85a3:8d3::" {
+		t.Errorf("expected IPv6 /64 masked key, got %q", k6)
 	}
 }
 

@@ -87,7 +87,7 @@ func (f *fakeRepo) RemoveMember(ctx context.Context, roomID, userID uuid.UUID) e
 var testTokenService = mustTokenService()
 
 func mustTokenService() *auth.TokenService {
-	tokens, err := auth.NewTokenService([]byte("room-handler-test-secret"), time.Hour)
+	tokens, err := auth.NewTokenService([]byte("room-handler-test-secret-at-least-32b!"), time.Hour)
 	if err != nil {
 		panic(err)
 	}

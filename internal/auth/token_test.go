@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const testSecret = "test-secret-that-is-long-enough"
+const testSecret = "test-secret-that-is-long-enough-32bytes!"
 
 func newService(t *testing.T, expiry time.Duration) *TokenService {
 	t.Helper()
@@ -175,6 +175,9 @@ func TestNewTokenService_EmptySecretRefused(t *testing.T) {
 	}
 	if _, err := NewTokenService([]byte{}, time.Hour); err == nil {
 		t.Fatal("expected zero-length secret to be refused")
+	}
+	if _, err := NewTokenService([]byte("short-secret"), time.Hour); err == nil {
+		t.Fatal("expected short secret (<32 bytes) to be refused")
 	}
 }
 

@@ -99,7 +99,7 @@ func (f *fakeRepo) IsMember(ctx context.Context, roomID, userID uuid.UUID) (bool
 var testTokenService = mustTokenService()
 
 func mustTokenService() *auth.TokenService {
-	tokens, err := auth.NewTokenService([]byte("message-handler-test-secret"), time.Hour)
+	tokens, err := auth.NewTokenService([]byte("message-handler-test-secret-at-least-32b!"), time.Hour)
 	if err != nil {
 		panic(err)
 	}

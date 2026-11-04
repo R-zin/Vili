@@ -62,7 +62,7 @@ func (f *fakeUsernames) UsernameByID(ctx context.Context, id uuid.UUID) (string,
 // the fakes so tests can arrange membership and users.
 func wsTestServer(t *testing.T) (*httptest.Server, *auth.TokenService, *Hub, *fakeMembership, *fakeUsernames) {
 	t.Helper()
-	tokens, err := auth.NewTokenService([]byte("ws-handler-test-secret"), time.Hour)
+	tokens, err := auth.NewTokenService([]byte("ws-handler-test-secret-at-least-32b!"), time.Hour)
 	if err != nil {
 		t.Fatalf("NewTokenService: %v", err)
 	}

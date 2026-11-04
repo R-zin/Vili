@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feature/**", "security/**"]
   pull_request:
 
 permissions: {}
@@ -19,7 +19,7 @@ jobs:
   # Fast gate: the exact checks the README mandates. No database required —
   # store integration tests self-skip without RUN_DB_TESTS.
   unit:
-    name: Build / vet / fmt / unit tests
+    name: Build / vet / fmt / unit tests / coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,20 +44,24 @@ jobs:
             exit 1
           fi
 
-      - name: Test
-        run: go test ./... -race -count=1
+      - name: Test with race detector & coverage
+        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
-  # Real-Postgres path: runs migrations + the env-gated integration test, then
-  # boots the server and drives the actual vili CLI through a full chat loop,
-  # asserting the membership gate returns 404 to a non-member for both read
-  # and post.
+      - name: Verify coverage file generated
+        run: |
+          test -s coverage.out || { echo "coverage.out missing or empty" >&2; exit 1; }
+          go tool cover -func=coverage.out | tail -n 1
+
+  # Real-Postgres path: runs migrations + real Postgres repository integration tests,
+  # boots the server and drives the actual vili CLI through full chat, room, and auth flows,
+  # verifying membership gates, refresh-token rotation, reuse detection, and security headers.
   integration:
-    name: Integration (Postgres) + CLI smoke
+    name: Integration (Postgres) + Real DB tests + CLI & Auth smoke
     runs-on: ubuntu-latest
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/vili?sslmode=disable
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/vili?sslmode=disable
-      JWT_SECRET: ci-secret-not-real-do-not-use-in-prod
+      JWT_SECRET: ci-secret-at-least-32-bytes-long-for-testing
       PORT: "8080"
       RUN_DB_TESTS: "1"
     services:
@@ -81,8 +85,8 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Store integration test (open / ping / migrate twice)
-        run: go test ./internal/store/... -run TestOpenPingMigrate -count=1 -v
+      - name: Database integration tests (store, user, room, message)
+        run: go test -v -race -count=1 ./internal/store/... ./internal/user/... ./internal/room/... ./internal/message/...
 
       - name: Build server and CLI
         run: |
@@ -107,7 +111,15 @@ jobs:
           cat server.log >&2
           exit 1
 
-      - name: CLI smoke — register, login, create, send, read back
+      - name: Verify HTTP security headers
+        run: |
+          HEADERS=$(curl -si http://localhost:8080/ready)
+          echo "$HEADERS"
+          echo "$HEADERS" | grep -qi "Strict-Transport-Security" || { echo "HSTS header missing" >&2; exit 1; }
+          echo "$HEADERS" | grep -qi "X-Content-Type-Options: nosniff" || { echo "nosniff header missing" >&2; exit 1; }
+          echo "$HEADERS" | grep -qi "Cross-Origin-Opener-Policy: same-origin" || { echo "COOP header missing" >&2; exit 1; }
+
+      - name: CLI smoke — register, login, create, send, read back, list rooms
         env:
           XDG_CONFIG_HOME: ${{ runner.temp }}/cfg-a
         run: |
@@ -122,15 +134,19 @@ jobs:
           HISTORY=$(./bin/vili --server http://localhost:8080 history "$ROOM_ID")
           echo "$HISTORY"
           echo "$HISTORY" | grep -q "hello world" || { echo "message missing from history" >&2; exit 1; }
+          ROOMS=$(./bin/vili --server http://localhost:8080 rooms)
+          echo "$ROOMS"
+          echo "$ROOMS" | grep -q "lobby" || { echo "lobby missing from rooms output" >&2; exit 1; }
           echo "ROOM_ID=$ROOM_ID" >> "$GITHUB_ENV"
 
-      - name: Membership gate — non-member gets 404 on history and post
+      - name: Membership gate — 404 for non-member, join room, send message, leave room
         env:
           XDG_CONFIG_HOME: ${{ runner.temp }}/cfg-b
         run: |
           set -e
           ./bin/vili --server http://localhost:8080 register bob anothersecret
           ./bin/vili --server http://localhost:8080 login bob anothersecret
+          # Non-member access is rejected
           for op in history send; do
             if ./bin/vili --server http://localhost:8080 $op "$ROOM_ID" probe 2>&1 | grep -qi "not found"; then
               echo "non-member $op correctly denied (404)"
@@ -139,6 +155,68 @@ jobs:
               exit 1
             fi
           done
+          # Bob joins the room
+          ./bin/vili --server http://localhost:8080 join "$ROOM_ID"
+          ./bin/vili --server http://localhost:8080 send "$ROOM_ID" "bob was here"
+          BOB_HIST=$(./bin/vili --server http://localhost:8080 history "$ROOM_ID")
+          echo "$BOB_HIST" | grep -q "bob was here" || { echo "bob message missing from history" >&2; exit 1; }
+          # Bob leaves the room
+          ./bin/vili --server http://localhost:8080 leave "$ROOM_ID"
+          if ./bin/vili --server http://localhost:8080 history "$ROOM_ID" 2>&1 | grep -qi "not found"; then
+            echo "former member correctly denied (404) after leaving room"
+          else
+            echo "FAIL: member was not denied after leaving" >&2
+            exit 1
+          fi
+
+      - name: Auth API smoke — token rotation and reuse detection
+        run: |
+          set -e
+          # Login via API
+          LOGIN_RES=$(curl -sf -X POST http://localhost:8080/v1/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"alice","password":"supersecret"}')
+          echo "Login response: $LOGIN_RES"
+          REFRESH_TOKEN=$(echo "$LOGIN_RES" | grep -o '"refresh_token":"[^"]*' | cut -d'"' -f4)
+          test -n "$REFRESH_TOKEN" || { echo "refresh_token missing from login response" >&2; exit 1; }
+
+          # Rotate token via POST /v1/auth/refresh
+          ROTATE_RES=$(curl -sf -X POST http://localhost:8080/v1/auth/refresh \
+            -H "Content-Type: application/json" \
+            -d "{\"refresh_token\":\"$REFRESH_TOKEN\"}")
+          echo "Rotate response: $ROTATE_RES"
+          NEW_REFRESH=$(echo "$ROTATE_RES" | grep -o '"refresh_token":"[^"]*' | cut -d'"' -f4)
+          test -n "$NEW_REFRESH" || { echo "new refresh_token missing from rotate response" >&2; exit 1; }
+          test "$NEW_REFRESH" != "$REFRESH_TOKEN" || { echo "refresh token was not rotated" >&2; exit 1; }
+
+          # Replaying consumed token must fail with 401 and revoke the family
+          REUSE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/v1/auth/refresh \
+            -H "Content-Type: application/json" \
+            -d "{\"refresh_token\":\"$REFRESH_TOKEN\"}")
+          if [ "$REUSE_STATUS" -ne 401 ]; then
+            echo "FAIL: expected 401 on refresh token reuse, got $REUSE_STATUS" >&2
+            exit 1
+          fi
+          echo "Consumed token reuse returned 401 as expected"
+
+          # Even newly rotated token must now return 401 because family is revoked
+          REVOKED_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/v1/auth/refresh \
+            -H "Content-Type: application/json" \
+            -d "{\"refresh_token\":\"$NEW_REFRESH\"}")
+          if [ "$REVOKED_STATUS" -ne 401 ]; then
+            echo "FAIL: expected 401 on revoked family token, got $REVOKED_STATUS" >&2
+            exit 1
+          fi
+          echo "Token family revoked on reuse attempt"
+
+      - name: CLI logout — clears local session and revokes server token
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/cfg-a
+        run: |
+          set -e
+          ./bin/vili --server http://localhost:8080 logout
+          test ! -f "${{ runner.temp }}/cfg-a/vili/session.json" || { echo "session.json still exists after logout" >&2; exit 1; }
+          echo "Session cleared successfully"
 
       - name: Server log
         if: always()
@@ -147,3 +225,13 @@ jobs:
       - name: Stop server
         if: always()
         run: kill "$(cat server.pid)" 2>/dev/null || true
+
+  # Build verification: confirms Dockerfile builds cleanly on production distroless base.
+  docker:
+    name: Docker build verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t vili-server:ci .

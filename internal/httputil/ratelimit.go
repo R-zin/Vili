@@ -16,17 +16,31 @@ import (
 // must never lock out traffic on an internal edge).
 type KeyFunc func(r *http.Request) (string, bool)
 
-// KeyByIP keys buckets by the client IP from RemoteAddr. Trusted proxy headers
-// (X-Forwarded-For) are deliberately NOT honored: without a configured trusted
-// -proxy list they are trivially spoofable, which would let an attacker rotate
-// the header to dodge the limit or frame a victim IP.
+// KeyByIP keys buckets by the client IP. It checks Fly-Client-IP (when deployed
+// on Fly.io) and falls back to RemoteAddr. IPv6 addresses are masked to /64 CIDR
+// to prevent IPv6 subnet rotation attacks.
 func KeyByIP(r *http.Request) (string, bool) {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
+	var host string
+	if flyIP := r.Header.Get("Fly-Client-IP"); flyIP != "" {
+		host = flyIP
+	} else {
+		var err error
+		host, _, err = net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
 	}
 	if host == "" {
 		return "", false
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip.To4() != nil {
+			return "ip:" + ip.String(), true
+		}
+		// IPv6: mask to /64 to prevent subnet rotation DoS
+		mask := net.CIDRMask(64, 128)
+		return "ip:" + ip.Mask(mask).String(), true
 	}
 	return "ip:" + host, true
 }

@@ -148,7 +148,9 @@ All endpoints are versioned under `/v1`. Protected routes require
 | GET | `/` | — | Liveness (`{"status":"ok"}`) |
 | GET | `/ready` | — | Readiness (200 if DB reachable, else 503) |
 | POST | `/v1/auth/register` | — | Create account → `201` safe user JSON |
-| POST | `/v1/auth/login` | — | Authenticate → `200 {token, user}` |
+| POST | `/v1/auth/login` | — | Authenticate → `200 {token, refresh_token, expires_at, user}` |
+| POST | `/v1/auth/refresh` | — | Exchange a refresh token for a rotated token pair → `200 {token, refresh_token, expires_at, user}`. Reusing a consumed token revokes the whole family → `401`. |
+| POST | `/v1/auth/logout` | — | Revoke a refresh token (idempotent — `200` even for an unknown token) |
 | POST | `/v1/createroom` | ✔ | Create a room (creator becomes owner) → `201` |
 | GET | `/v1/listrooms` | ✔ | List rooms → `200` |
 | POST | `/v1/rooms/{id}/join` | ✔ | Join a room (member role) → `200` |
@@ -214,6 +216,7 @@ server exits non-zero if either is missing/empty.
 | `JWT_SECRET` | ✅ | — | HS256 signing secret (use a long random value) |
 | `PORT` | — | `8080` | HTTP listen port |
 | `JWT_EXPIRY_MINUTES` | — | `60` | Access-token lifetime |
+| `REFRESH_TOKEN_TTL` | — | `720h` (30 days) | Refresh-token lifetime |
 | `HTTP_READ_TIMEOUT` | — | `15s` | Request read timeout |
 | `HTTP_READ_HEADER_TIMEOUT` | — | `5s` | Read-header timeout (slowloris guard) |
 | `HTTP_WRITE_TIMEOUT` | — | `15s` | Response write timeout |
@@ -328,6 +331,7 @@ Current green gate for CI: `go build ./...`, `go vet ./...`, `gofmt -l .` empty,
 - [x] **Phase 3** — CLI client: login/session persistence, room browsing, message send, interactive chat view (poll-based)
 - [x] **Phase 4** — real-time messaging (WebSocket), presence, typing indicators; live CLI chat view
 - [x] **Phase 5** — production hardening (security headers, body caps, panic recovery, deny-by-default CORS), observability (access logs, `/metrics`, gated pprof), rate limiting (per-IP/per-user token buckets + a WS connection cap), Docker/fly deployment, **Homebrew distribution**
+- [x] **Phase 6 (started)** — account lifecycle: refresh-token rotation with family reuse-detection and server-side logout. CLI sessions renew silently. _In progress: unread counts, @mentions, private rooms + invite codes._
 
 ## Built with
 

@@ -89,6 +89,16 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 		baseURL = *server
 	}
 	client := NewClient(baseURL, sessionToken(sess, *tokenOverride))
+	// Wire silent renewal: when the access token nears expiry, the client
+	// rotates it with the stored refresh token and persists the new pair.
+	if sess != nil && *tokenOverride == "" {
+		client.RefreshToken = sess.RefreshToken
+		client.TokenExpiry = sess.TokenExpiry
+		client.OnTokenRefresh = func(access, refresh string, expiry time.Time) {
+			sess.Token, sess.RefreshToken, sess.TokenExpiry = access, refresh, expiry
+			_ = sess.Save() // best-effort; a lost save just forces re-login next time
+		}
+	}
 
 	switch cmd {
 	case "register":
@@ -96,7 +106,7 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 	case "login":
 		return cmdLogin(ctx, out, client, baseURL, cmdArgs)
 	case "logout":
-		return cmdLogout(out)
+		return cmdLogout(ctx, out, client)
 	case "rooms":
 		return cmdRooms(ctx, out, client)
 	case "create":
@@ -167,19 +177,28 @@ func cmdLogin(ctx context.Context, out io.Writer, c *Client, baseURL string, arg
 	if err := requireArgs(args, 2, "login <username> <password>"); err != nil {
 		return err
 	}
-	token, u, err := c.Login(ctx, args[0], args[1])
+	resp, err := c.Login(ctx, args[0], args[1])
 	if err != nil {
 		return err
 	}
-	sess := &Session{BaseURL: baseURL, Token: token, User: u}
+	sess := &Session{
+		BaseURL:      baseURL,
+		Token:        resp.Token,
+		RefreshToken: resp.RefreshToken,
+		TokenExpiry:  resp.ExpiresAt,
+		User:         resp.User,
+	}
 	if err := sess.Save(); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "logged in as %s — session saved\n", u.Username)
+	fmt.Fprintf(out, "logged in as %s — session saved\n", resp.User.Username)
 	return nil
 }
 
-func cmdLogout(out io.Writer) error {
+func cmdLogout(ctx context.Context, out io.Writer, c *Client) error {
+	// Best-effort server-side revocation so the refresh token can't be reused
+	// after the session file is gone; a network failure must not block logout.
+	_ = c.Logout(ctx)
 	if err := ClearSession(); err != nil {
 		return err
 	}
@@ -291,9 +310,84 @@ func cmdSend(ctx context.Context, out io.Writer, c *Client, args []string) error
 	return nil
 }
 
-// printMessages writes messages oldest-first in a chat-like form.
+// printMessages writes messages oldest-first in a chat-like form,
+// sanitizing ANSI escape codes and control characters to prevent terminal injection.
 func printMessages(out io.Writer, messages []Message) {
 	for _, m := range messages {
-		fmt.Fprintf(out, "%s  %s: %s\n", m.CreatedAt.Local().Format("15:04:05"), m.Username, m.Content)
+		fmt.Fprintf(out, "%s  %s: %s\n",
+			m.CreatedAt.Local().Format("15:04:05"),
+			sanitizeTerminal(m.Username),
+			sanitizeTerminal(m.Content),
+		)
 	}
+}
+
+// sanitizeTerminal strips ANSI escape sequences and non-printable control characters
+// (except newline and tab) from untrusted user input before terminal rendering.
+func sanitizeTerminal(s string) string {
+	const (
+		stateNormal = iota
+		stateEscape
+		stateCSI
+		stateOSC
+		stateOSCEscape
+		stateCharset
+	)
+
+	var b strings.Builder
+	b.Grow(len(s))
+	state := stateNormal
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch state {
+		case stateNormal:
+			if c == 0x1b { // ESC
+				state = stateEscape
+			} else if c == '\n' || c == '\t' {
+				b.WriteByte(c)
+			} else if c < 32 || c == 127 {
+				// Strip raw ASCII control characters
+				continue
+			} else {
+				b.WriteByte(c)
+			}
+		case stateEscape:
+			switch c {
+			case '[':
+				state = stateCSI
+			case ']':
+				state = stateOSC
+			case '(', ')', '*', '+':
+				state = stateCharset
+			default:
+				// Single byte following ESC ends sequence (e.g., ESC c, ESC M)
+				state = stateNormal
+			}
+		case stateCSI:
+			// Final CSI byte is in range 0x40-0x7E (@ through ~)
+			if c >= 0x40 && c <= 0x7E {
+				state = stateNormal
+			}
+		case stateOSC:
+			if c == 0x07 { // BEL
+				state = stateNormal
+			} else if c == 0x1b {
+				state = stateOSCEscape
+			}
+		case stateOSCEscape:
+			if c == '\\' { // ST (String Terminator: ESC \)
+				state = stateNormal
+			} else if c == '[' {
+				state = stateCSI
+			} else if c == ']' {
+				state = stateOSC
+			} else {
+				state = stateNormal
+			}
+		case stateCharset:
+			state = stateNormal
+		}
+	}
+	return b.String()
 }

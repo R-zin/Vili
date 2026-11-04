@@ -5,6 +5,8 @@
 .gitignore
 .github/
 .agenthub/
+.agents/
+skills-lock.json
 .claude/
 .idea/
 .vscode/

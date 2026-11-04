@@ -112,7 +112,7 @@ func TestAuthRateLimit(t *testing.T) {
 	lim := ratelimit.New(0.5, 1) // burst 1
 	defer lim.Stop()
 	mw := Middleware{AuthLimit: httputil.RateLimit(lim, httputil.KeyByIP)}
-	h := NewRouter(user.NewHandler(nil, newTestTokens(t)), nil, nil, nil, newTestTokens(t), fakePinger{}, mw)
+	h := NewRouter(user.NewHandler(nil, newTestTokens(t), nil, 0), nil, nil, nil, newTestTokens(t), fakePinger{}, mw)
 
 	do := func() int {
 		req := httptest.NewRequest(http.MethodPost, "/v1/auth/login", nil)
@@ -198,7 +198,7 @@ func TestBodyCapRejectsOversizedJSON(t *testing.T) {
 			return httputil.Chain(next, httputil.MaxBodyBytes(64))
 		},
 	}
-	h := NewRouter(user.NewHandler(nil, tokens), nil, nil, nil, tokens, fakePinger{}, mw)
+	h := NewRouter(user.NewHandler(nil, tokens, nil, 0), nil, nil, nil, tokens, fakePinger{}, mw)
 
 	// A JSON body far larger than 64 bytes.
 	big := `{"username":"` + strings.Repeat("u", 256) + `","password":"supersecret"}`

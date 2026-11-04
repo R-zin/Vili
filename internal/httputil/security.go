@@ -17,18 +17,25 @@ import (
 func SecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		// Browsers must not sniff content off the declared application/json (or
-		// the demo's text/html) content type.
+		// Browsers must not sniff content off declared MIME types.
 		h.Set("X-Content-Type-Options", "nosniff")
-		// The API has no reason to be framed; blocks clickjacking of the demo.
+		// Block clickjacking across the entire API and demo.
 		h.Set("X-Frame-Options", "DENY")
-		// Send no referrer to cross-origin requests.
+		// Prevent referrer leaks to cross-origin destinations.
 		h.Set("Referrer-Policy", "no-referrer")
-		// CSP: the JSON API has no scripts/styles; the self-contained demo uses
-		// only inline script/style, so allow those from 'self' only. This is a
-		// defense-in-depth value for the one HTML page the server might serve.
+		// HTTP Strict Transport Security (HSTS): enforce HTTPS for 2 years.
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+		// Disable browser device features (camera, mic, etc.)
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+		// Modern cross-origin isolation headers against Spectre attacks.
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
+		// Prevent caching of sensitive JSON API responses by intermediate proxies.
+		h.Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		h.Set("Pragma", "no-cache")
+		// Content Security Policy
 		h.Set("Content-Security-Policy",
-			"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'none'; frame-ancestors 'none'")
+			"default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 		next.ServeHTTP(w, r)
 	})
 }

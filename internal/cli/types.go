@@ -16,10 +16,13 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// loginResponse mirrors the backend's login body {token, user}.
+// loginResponse mirrors the backend's login/refresh body: an access token, the
+// refresh token used to renew it, the access token's expiry, and the user.
 type loginResponse struct {
-	Token string `json:"token"`
-	User  User   `json:"user"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	User         User      `json:"user"`
 }
 
 // Room mirrors the backend's room JSON.

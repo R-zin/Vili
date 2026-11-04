@@ -23,11 +23,17 @@ type TokenService struct {
 	expiry time.Duration
 }
 
+// MinJWTSecretBytes is the minimum key length enforced for HS256 signing (RFC 7518 § 3.2).
+const MinJWTSecretBytes = 32
+
 // NewTokenService builds a TokenService. It returns an error if the secret is
-// empty or the expiry is non-positive.
+// shorter than MinJWTSecretBytes (32 bytes / 256 bits) or the expiry is non-positive.
 func NewTokenService(secret []byte, expiry time.Duration) (*TokenService, error) {
 	if len(secret) == 0 {
 		return nil, errors.New("auth: JWT secret must not be empty")
+	}
+	if len(secret) < MinJWTSecretBytes {
+		return nil, fmt.Errorf("auth: JWT secret must be at least %d bytes (256 bits), got %d", MinJWTSecretBytes, len(secret))
 	}
 	if expiry <= 0 {
 		return nil, fmt.Errorf("auth: JWT expiry must be positive, got %s", expiry)
@@ -37,6 +43,9 @@ func NewTokenService(secret []byte, expiry time.Duration) (*TokenService, error)
 	copy(s, secret)
 	return &TokenService{secret: s, expiry: expiry}, nil
 }
+
+// Expiry returns the configured access-token lifetime.
+func (s *TokenService) Expiry() time.Duration { return s.expiry }
 
 // Issue mints a signed token whose subject is the given user id.
 func (s *TokenService) Issue(userID uuid.UUID) (string, error) {
