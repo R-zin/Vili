@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -41,5 +42,69 @@ func TestOpenPingMigrate(t *testing.T) {
 		if _, err := Migrate(context.Background(), db); err != nil {
 			t.Fatalf("Migrate (run %d): %v", i+1, err)
 		}
+	}
+}
+
+// TestPurge verifies the janitor removes only rows past their grace window.
+func TestPurge(t *testing.T) {
+	if os.Getenv("RUN_DB_TESTS") != "1" || os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("set RUN_DB_TESTS=1 and TEST_DATABASE_URL to run database integration tests")
+	}
+	db, err := Open(config.Config{DatabaseURL: os.Getenv("TEST_DATABASE_URL"),
+		DB: config.DB{MaxOpenConns: 5, MaxIdleConns: 5, ConnMaxLifetime: time.Minute}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+
+	name := fmt.Sprintf("purge_%d", time.Now().UnixNano())
+	var uid, rid string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO users (id, username, password_hash) VALUES (gen_random_uuid(), $1, 'x') RETURNING id`, name).Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO rooms (id, name, created_by) VALUES (gen_random_uuid(), $1, $2) RETURNING id`, name, uid).Scan(&rid); err != nil {
+		t.Fatal(err)
+	}
+	for i, ago := range []string{"2 days", "1 hour"} { // long-expired, recently expired
+		if _, err := db.ExecContext(ctx, `INSERT INTO refresh_tokens (id, user_id, family_id, token_hash, expires_at)
+			VALUES (gen_random_uuid(), $1, gen_random_uuid(), $2, now() - $3::interval)`, uid, fmt.Sprintf("%s_%d", name, i), ago); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO refresh_tokens (id, user_id, family_id, token_hash, expires_at)
+		VALUES (gen_random_uuid(), $1, gen_random_uuid(), $2, now() + interval '1 day')`, uid, name+"_live"); err != nil {
+		t.Fatal(err)
+	}
+	for i, ago := range []string{"30 days", "1 day"} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO room_invites (id, room_id, created_by, code_hash, expires_at)
+			VALUES (gen_random_uuid(), $1, $2, $3, now() - $4::interval)`, rid, uid, fmt.Sprintf("%s_i%d", name, i), ago); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, _, err := Purge(ctx, db); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	count := func(q string) (n int) {
+		if err := db.QueryRowContext(ctx, q, uid).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if n := count(`SELECT count(*) FROM refresh_tokens WHERE user_id = $1`); n != 2 {
+		t.Fatalf("expected recently-expired + live tokens to remain, got %d", n)
+	}
+	if n := count(`SELECT count(*) FROM room_invites WHERE created_by = $1`); n != 1 {
+		t.Fatalf("expected only the recently-expired invite to remain, got %d", n)
+	}
+	// Idempotent.
+	if tk, iv, err := Purge(ctx, db); err != nil || tk != 0 || iv != 0 {
+		t.Fatalf("second purge should be a no-op: %d %d %v", tk, iv, err)
 	}
 }

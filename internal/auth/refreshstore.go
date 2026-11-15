@@ -27,6 +27,16 @@ type RefreshToken struct {
 	Consumed  bool
 }
 
+// Session is one signed-in device/login: a refresh-token family. ID is the
+// family id; LastActive is when its newest token was minted (each silent
+// renewal mints one).
+type Session struct {
+	ID         uuid.UUID `json:"id"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastActive time.Time `json:"last_active"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
 // RefreshStore persists and rotates refresh tokens. All lookups are by digest
 // (never the raw token). It is satisfied by the user feature's Postgres
 // repository at the wiring layer; defining the interface here keeps token
@@ -43,4 +53,12 @@ type RefreshStore interface {
 	RevokeRefreshFamily(ctx context.Context, familyID uuid.UUID) error
 	// RevokeRefreshToken deletes a single token by digest (logout).
 	RevokeRefreshToken(ctx context.Context, hash string) error
+	// ListSessions returns the user's live sessions (families with an unused,
+	// unexpired token), most recently active first.
+	ListSessions(ctx context.Context, userID uuid.UUID) ([]Session, error)
+	// RevokeSession ends one of the user's sessions; it reports whether a
+	// session was found (a family of another user is never touched).
+	RevokeSession(ctx context.Context, userID, familyID uuid.UUID) (bool, error)
+	// RevokeAllSessions ends every session of the user.
+	RevokeAllSessions(ctx context.Context, userID uuid.UUID) error
 }

@@ -94,6 +94,10 @@ jobs:
           go build -o bin/vili ./cmd/vili
 
       - name: Start server
+        env:
+          # The e2e script performs many auth calls from one IP.
+          RATE_LIMIT_AUTH_RPS: "100"
+          RATE_LIMIT_AUTH_BURST: "100"
         run: |
           ./bin/vili-server > server.log 2>&1 &
           echo $! > server.pid
@@ -217,6 +221,9 @@ jobs:
           ./bin/vili --server http://localhost:8080 logout
           test ! -f "${{ runner.temp }}/cfg-a/vili/session.json" || { echo "session.json still exists after logout" >&2; exit 1; }
           echo "Session cleared successfully"
+
+      - name: E2E — private rooms, invites, mentions, unread, edit/delete, search, moderation, DMs, account lifecycle
+        run: ./scripts/e2e.sh http://localhost:8080 ./bin/vili
 
       - name: Server log
         if: always()

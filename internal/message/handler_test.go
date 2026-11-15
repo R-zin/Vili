@@ -21,11 +21,13 @@ type fakeRepo struct {
 	messages  map[uuid.UUID][]Message
 	rooms     map[uuid.UUID]bool
 	members   map[uuid.UUID]map[uuid.UUID]bool // roomID -> userID -> member
-	usernames map[uuid.UUID]string             // userID -> username (join-at-read)
+	roles     map[uuid.UUID]map[uuid.UUID]string
+	usernames map[uuid.UUID]string // userID -> username (join-at-read)
 	listErr   error
 	createErr error
 
 	gotLimit  int
+	gotQuery  string
 	gotBefore *time.Time
 }
 
@@ -35,6 +37,7 @@ func newFakeRepo() *fakeRepo {
 		rooms:     make(map[uuid.UUID]bool),
 		members:   make(map[uuid.UUID]map[uuid.UUID]bool),
 		usernames: make(map[uuid.UUID]string),
+		roles:     make(map[uuid.UUID]map[uuid.UUID]string),
 	}
 }
 
@@ -61,6 +64,12 @@ func (f *fakeRepo) Create(ctx context.Context, msg *Message) error {
 	}
 	if !f.rooms[msg.RoomID] {
 		return ErrRoomNotFound
+	}
+	if msg.ReplyTo != nil {
+		rid, _, ok := f.find(*msg.ReplyTo)
+		if !ok || rid != msg.RoomID {
+			return ErrReplyNotFound
+		}
 	}
 	if msg.ID == uuid.Nil {
 		msg.ID = uuid.New()
@@ -90,6 +99,70 @@ func (f *fakeRepo) ListByRoom(ctx context.Context, roomID uuid.UUID, limit int, 
 	f.gotLimit = limit
 	f.gotBefore = before
 	return f.messages[roomID], nil
+}
+
+func (f *fakeRepo) MemberRole(ctx context.Context, roomID, userID uuid.UUID) (string, error) {
+	if !f.members[roomID][userID] {
+		return "", ErrNotMember
+	}
+	if r := f.roles[roomID][userID]; r != "" {
+		return r, nil
+	}
+	return "member", nil
+}
+
+func (f *fakeRepo) find(id uuid.UUID) (roomID uuid.UUID, idx int, ok bool) {
+	for rid, msgs := range f.messages {
+		for i, m := range msgs {
+			if m.ID == id {
+				return rid, i, true
+			}
+		}
+	}
+	return uuid.Nil, 0, false
+}
+
+func (f *fakeRepo) ByID(ctx context.Context, id uuid.UUID) (Message, error) {
+	rid, i, ok := f.find(id)
+	if !ok {
+		return Message{}, ErrMessageNotFound
+	}
+	return f.messages[rid][i], nil
+}
+
+func (f *fakeRepo) Edit(ctx context.Context, id uuid.UUID, content string, cands []string) (Message, error) {
+	rid, i, ok := f.find(id)
+	if !ok || f.messages[rid][i].Deleted {
+		return Message{}, ErrMessageNotFound
+	}
+	now := time.Now()
+	f.messages[rid][i].Content, f.messages[rid][i].Mentions, f.messages[rid][i].EditedAt = content, cands, &now
+	return f.messages[rid][i], nil
+}
+
+func (f *fakeRepo) Delete(ctx context.Context, id uuid.UUID) error {
+	rid, i, ok := f.find(id)
+	if !ok || f.messages[rid][i].Deleted {
+		return ErrMessageNotFound
+	}
+	f.messages[rid][i].Content, f.messages[rid][i].Deleted = "", true
+	return nil
+}
+
+func (f *fakeRepo) Search(ctx context.Context, userID uuid.UUID, q string, roomID *uuid.UUID, limit int) ([]Message, error) {
+	f.gotQuery = q
+	out := []Message{}
+	for rid, msgs := range f.messages {
+		if !f.members[rid][userID] || (roomID != nil && *roomID != rid) {
+			continue
+		}
+		for _, m := range msgs {
+			if !m.Deleted && strings.Contains(m.Content, q) {
+				out = append(out, m)
+			}
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeRepo) IsMember(ctx context.Context, roomID, userID uuid.UUID) (bool, error) {
@@ -473,5 +546,237 @@ func TestParseLimit(t *testing.T) {
 				t.Fatalf("parseLimit(%q) = %d, want %d", tc.raw, got, tc.want)
 			}
 		})
+	}
+}
+
+// ---- edit / delete / reply / mentions / search -------------------------------
+
+type msgFixture struct {
+	repo   *fakeRepo
+	pub    *fakePublisher
+	h      *Handler
+	room   uuid.UUID
+	author uuid.UUID
+	other  uuid.UUID
+	admin  uuid.UUID
+	out    uuid.UUID
+}
+
+func newMsgFixture() *msgFixture {
+	f := &msgFixture{repo: newFakeRepo(), pub: &fakePublisher{}, room: uuid.New(),
+		author: uuid.New(), other: uuid.New(), admin: uuid.New(), out: uuid.New()}
+	f.h = NewHandler(f.repo, f.pub)
+	f.repo.rooms[f.room] = true
+	for _, u := range []uuid.UUID{f.author, f.other, f.admin} {
+		f.repo.addMember(f.room, u)
+	}
+	f.repo.roles[f.room] = map[uuid.UUID]string{f.admin: "admin"}
+	return f
+}
+
+func (f *msgFixture) post(t *testing.T, body string) Message {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.SetPathValue("id", f.room.String())
+	rec := authed(t, f.author, f.h.create, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("post: %d %s", rec.Code, rec.Body.String())
+	}
+	var m Message
+	_ = json.Unmarshal(rec.Body.Bytes(), &m)
+	return m
+}
+
+func (f *msgFixture) call(t *testing.T, who uuid.UUID, fn http.HandlerFunc, method, body string, msg uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, "/", strings.NewReader(body))
+	req.SetPathValue("id", f.room.String())
+	req.SetPathValue("msgID", msg.String())
+	return authed(t, who, fn, req)
+}
+
+func TestExtractMentions(t *testing.T) {
+	cases := map[string][]string{
+		"hi @alice and @bob.":  {"alice", "bob"},
+		"@alice @alice":        {"alice"},
+		"mail me a@b.com":      nil,
+		"email@host @real":     {"real"},
+		"(@paren)":             {"paren"},
+		"@a-b_c.d ok":          {"a-b_c.d"},
+		"trailing @dash- here": {"dash"},
+		"no mentions":          nil,
+		"@@double":             nil,
+		"@":                    nil,
+		"\n@newline":           {"newline"},
+		"@u1 @u2 @u3 @u4 @u5 @u6 @u7 @u8 @u9 @u10 @u11": {"u1", "u2", "u3", "u4", "u5", "u6", "u7", "u8", "u9", "u10"},
+	}
+	for in, want := range cases {
+		got := extractMentions(in)
+		if len(got) != len(want) {
+			t.Errorf("%q: got %v want %v", in, got, want)
+			continue
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("%q: got %v want %v", in, got, want)
+			}
+		}
+	}
+}
+
+func TestCreate_MentionsAndReply(t *testing.T) {
+	f := newMsgFixture()
+	first := f.post(t, `{"content":"hello @other"}`)
+	if len(first.Mentions) != 1 || first.Mentions[0] != "other" {
+		t.Fatalf("mentions = %v", first.Mentions)
+	}
+	reply := f.post(t, `{"content":"re","reply_to":"`+first.ID.String()+`"}`)
+	if reply.ReplyTo == nil || *reply.ReplyTo != first.ID {
+		t.Fatalf("reply_to lost: %+v", reply)
+	}
+	// Reply to a message that doesn't exist in this room -> 400.
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"content":"x","reply_to":"`+uuid.New().String()+`"}`))
+	req.SetPathValue("id", f.room.String())
+	if rec := authed(t, f.author, f.h.create, req); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad reply target: %d", rec.Code)
+	}
+}
+
+func TestEdit(t *testing.T) {
+	f := newMsgFixture()
+	m := f.post(t, `{"content":"orig"}`)
+	f.pub.events = nil
+
+	if rec := f.call(t, f.other, f.h.edit, http.MethodPatch, `{"content":"hax"}`, m.ID); rec.Code != http.StatusForbidden {
+		t.Fatalf("edit by non-author: %d", rec.Code)
+	}
+	if rec := f.call(t, f.out, f.h.edit, http.MethodPatch, `{"content":"hax"}`, m.ID); rec.Code != http.StatusNotFound {
+		t.Fatalf("edit by outsider: %d", rec.Code)
+	}
+	if rec := f.call(t, f.author, f.h.edit, http.MethodPatch, `{"content":""}`, m.ID); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty edit: %d", rec.Code)
+	}
+	if rec := f.call(t, f.author, f.h.edit, http.MethodPatch, `{`, m.ID); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad json: %d", rec.Code)
+	}
+	if rec := f.call(t, f.author, f.h.edit, http.MethodPatch, `{"content":"x"}`, uuid.New()); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown message: %d", rec.Code)
+	}
+	rec := f.call(t, f.author, f.h.edit, http.MethodPatch, `{"content":"fixed @other"}`, m.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("edit: %d %s", rec.Code, rec.Body.String())
+	}
+	var got Message
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.Content != "fixed @other" || got.EditedAt == nil || len(got.Mentions) != 1 {
+		t.Fatalf("edited message: %+v", got)
+	}
+	if len(f.pub.events) != 1 || f.pub.events[0].Type != event.MessageEdited {
+		t.Fatalf("expected one message.edited broadcast, got %+v", f.pub.events)
+	}
+}
+
+func TestEdit_WrongRoomAndDeleted(t *testing.T) {
+	f := newMsgFixture()
+	m := f.post(t, `{"content":"orig"}`)
+	// Same message id addressed through a different room it isn't in.
+	otherRoom := uuid.New()
+	f.repo.rooms[otherRoom] = true
+	f.repo.addMember(otherRoom, f.author)
+	req := httptest.NewRequest(http.MethodPatch, "/", strings.NewReader(`{"content":"x"}`))
+	req.SetPathValue("id", otherRoom.String())
+	req.SetPathValue("msgID", m.ID.String())
+	if rec := authed(t, f.author, f.h.edit, req); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-room edit: %d", rec.Code)
+	}
+	if rec := f.call(t, f.author, f.h.delete, http.MethodDelete, "", m.ID); rec.Code != http.StatusOK {
+		t.Fatalf("delete: %d", rec.Code)
+	}
+	if rec := f.call(t, f.author, f.h.edit, http.MethodPatch, `{"content":"x"}`, m.ID); rec.Code != http.StatusNotFound {
+		t.Fatalf("edit deleted: %d", rec.Code)
+	}
+	if rec := f.call(t, f.author, f.h.delete, http.MethodDelete, "", m.ID); rec.Code != http.StatusNotFound {
+		t.Fatalf("double delete: %d", rec.Code)
+	}
+	if rec := f.call(t, f.author, f.h.edit, http.MethodPatch, `{"content":"x"}`, uuid.Nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("nil id: %d", rec.Code)
+	}
+}
+
+func TestDelete_Permissions(t *testing.T) {
+	f := newMsgFixture()
+	m1 := f.post(t, `{"content":"one"}`)
+	m2 := f.post(t, `{"content":"two"}`)
+	f.pub.events = nil
+
+	if rec := f.call(t, f.other, f.h.delete, http.MethodDelete, "", m1.ID); rec.Code != http.StatusForbidden {
+		t.Fatalf("member deleting others': %d", rec.Code)
+	}
+	if rec := f.call(t, f.out, f.h.delete, http.MethodDelete, "", m1.ID); rec.Code != http.StatusNotFound {
+		t.Fatalf("outsider delete: %d", rec.Code)
+	}
+	if rec := f.call(t, f.admin, f.h.delete, http.MethodDelete, "", m1.ID); rec.Code != http.StatusOK {
+		t.Fatalf("admin moderation delete: %d", rec.Code)
+	}
+	if rec := f.call(t, f.author, f.h.delete, http.MethodDelete, "", m2.ID); rec.Code != http.StatusOK {
+		t.Fatalf("author delete: %d", rec.Code)
+	}
+	if len(f.pub.events) != 2 || f.pub.events[0].Type != event.MessageDeleted {
+		t.Fatalf("expected two message.deleted events, got %+v", f.pub.events)
+	}
+	if !strings.Contains(string(f.pub.events[0].Payload), m1.ID.String()) {
+		t.Fatalf("payload should carry id: %s", f.pub.events[0].Payload)
+	}
+	if got, _ := f.repo.ByID(context.Background(), m1.ID); got.Content != "" || !got.Deleted {
+		t.Fatalf("content must be erased: %+v", got)
+	}
+}
+
+func TestBadIDs(t *testing.T) {
+	f := newMsgFixture()
+	for _, fn := range []http.HandlerFunc{f.h.edit, f.h.delete} {
+		req := httptest.NewRequest(http.MethodDelete, "/", nil)
+		req.SetPathValue("id", "nope")
+		req.SetPathValue("msgID", uuid.New().String())
+		if rec := authed(t, f.author, fn, req); rec.Code != http.StatusBadRequest {
+			t.Fatalf("bad room id: %d", rec.Code)
+		}
+		req = httptest.NewRequest(http.MethodDelete, "/", nil)
+		req.SetPathValue("id", f.room.String())
+		req.SetPathValue("msgID", "nope")
+		if rec := authed(t, f.author, fn, req); rec.Code != http.StatusBadRequest {
+			t.Fatalf("bad message id: %d", rec.Code)
+		}
+	}
+}
+
+func TestSearch(t *testing.T) {
+	f := newMsgFixture()
+	f.post(t, `{"content":"needle in haystack"}`)
+	get := func(who uuid.UUID, qs string) *httptest.ResponseRecorder {
+		return authed(t, who, f.h.search, httptest.NewRequest(http.MethodGet, "/v1/search?"+qs, nil))
+	}
+	rec := get(f.other, "q=needle")
+	var res []Message
+	_ = json.Unmarshal(rec.Body.Bytes(), &res)
+	if rec.Code != http.StatusOK || len(res) != 1 {
+		t.Fatalf("search: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := get(f.out, "q=needle"); !strings.Contains(rec.Body.String(), "[]") {
+		t.Fatalf("outsider must see no results: %s", rec.Body.String())
+	}
+	for _, bad := range []string{"", "q=", "q=" + strings.Repeat("x", 201), "q=a&room_id=zzz", "q=a&limit=x"} {
+		if rec := get(f.other, bad); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%q: %d", bad, rec.Code)
+		}
+	}
+	if rec := get(f.other, "q=needle&room_id="+f.room.String()); rec.Code != http.StatusOK {
+		t.Fatalf("room-scoped: %d", rec.Code)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/search?q=a", nil)
+	rec = httptest.NewRecorder()
+	f.h.search(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated search: %d", rec.Code)
 	}
 }

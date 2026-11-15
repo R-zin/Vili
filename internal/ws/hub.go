@@ -102,6 +102,47 @@ func (h *Hub) Broadcast(roomID uuid.UUID, e event.Event) {
 	}
 }
 
+// Disconnect closes every connection userID holds to roomID, used when the
+// user is removed from (or leaves) the room so they stop receiving its traffic
+// at once. Unknown rooms/users are a no-op.
+func (h *Hub) Disconnect(roomID, userID uuid.UUID) {
+	h.mu.RLock()
+	var victims []*Client
+	for c := range h.rooms[roomID] {
+		if c.userID == userID {
+			victims = append(victims, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range victims {
+		c.close(websocket.StatusPolicyViolation, "no longer a member of this room")
+	}
+}
+
+// CloseRoom closes every connection to roomID, used when the room is deleted.
+func (h *Hub) CloseRoom(roomID uuid.UUID) {
+	h.mu.RLock()
+	victims := make([]*Client, 0, len(h.rooms[roomID]))
+	for c := range h.rooms[roomID] {
+		victims = append(victims, c)
+	}
+	h.mu.RUnlock()
+	for _, c := range victims {
+		c.close(websocket.StatusGoingAway, "room deleted")
+	}
+}
+
+// Stats returns the number of live connections and of rooms with at least one
+// connection, for metrics.
+func (h *Hub) Stats() (conns, rooms int) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, set := range h.rooms {
+		conns += len(set)
+	}
+	return conns, len(h.rooms)
+}
+
 // ConnCount returns the number of live connections held by userID across all
 // rooms. The handler uses it to reject an over-cap upgrade with 429 before
 // hijacking; Join remains the authoritative atomic check.

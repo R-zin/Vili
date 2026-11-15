@@ -7,6 +7,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -77,6 +78,11 @@ type Security struct {
 	// file, so neither needs a CORS grant). Entries are scheme://host[:port]
 	// origins.
 	CORSAllowedOrigins []string
+	// TrustedProxies lists CIDRs/IPs of reverse proxies whose Fly-Client-IP /
+	// X-Forwarded-For headers are believed when deriving the client address for
+	// per-IP rate limiting. Empty (default) trusts no proxy: the TCP peer is
+	// used, so behind a proxy all clients share one bucket until this is set.
+	TrustedProxies []string
 }
 
 // RateLimit holds the token-bucket limiter knobs. RPS is the sustained refill
@@ -227,6 +233,12 @@ func (cfg *Config) loadSecurity() error {
 		return err
 	}
 	cfg.Security.CORSAllowedOrigins = listEnv("CORS_ALLOWED_ORIGINS", defaultCORSAllowedOrigins)
+	cfg.Security.TrustedProxies = listEnv("TRUSTED_PROXIES", "")
+	for _, p := range cfg.Security.TrustedProxies {
+		if _, _, err := net.ParseCIDR(p); err != nil && net.ParseIP(p) == nil {
+			return fmt.Errorf("config: TRUSTED_PROXIES entry %q is not an IP or CIDR", p)
+		}
+	}
 	return nil
 }
 

@@ -63,13 +63,35 @@ type refreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-// RegisterRoutes mounts the public auth routes on the mux. wrap applies to all
-// of them (the wiring layer passes its per-IP rate limiter, or nil to skip).
-func (h *Handler) RegisterRoutes(mux *http.ServeMux, wrap func(http.Handler) http.Handler) {
+// RegisterRoutes mounts the auth routes on the mux. wrap applies to the
+// public routes and to the password-verifying account routes (the wiring layer
+// passes its per-IP rate limiter, or nil to skip); require is the auth
+// middleware for the protected account routes (/v1/me...). require may be nil
+// only in tests that exercise the public routes alone.
+func (h *Handler) RegisterRoutes(mux *http.ServeMux, wrap func(http.Handler) http.Handler, require func(http.HandlerFunc) http.Handler) {
 	mux.Handle("POST /v1/auth/register", apply(wrap, h.register))
 	mux.Handle("POST /v1/auth/login", apply(wrap, h.login))
 	mux.Handle("POST /v1/auth/refresh", apply(wrap, h.refreshHandler))
 	mux.Handle("POST /v1/auth/logout", apply(wrap, h.logout))
+	if require == nil {
+		return
+	}
+	mux.Handle("GET /v1/me", require(h.me))
+	// Routes that verify the current password are also throttled per IP so
+	// a stolen access token cannot be used to brute-force it.
+	mux.Handle("POST /v1/me/password", applyH(wrap, require(h.changePassword)))
+	mux.Handle("DELETE /v1/me", applyH(wrap, require(h.deleteAccount)))
+	mux.Handle("GET /v1/me/sessions", require(h.listSessions))
+	mux.Handle("DELETE /v1/me/sessions", require(h.revokeAllSessions))
+	mux.Handle("DELETE /v1/me/sessions/{id}", require(h.revokeSession))
+}
+
+// applyH wraps an http.Handler with the middleware, or returns it untouched.
+func applyH(mw func(http.Handler) http.Handler, h http.Handler) http.Handler {
+	if mw == nil {
+		return h
+	}
+	return mw(h)
 }
 
 // apply wraps fn with the middleware, or returns fn untouched when mw is nil.
@@ -288,4 +310,173 @@ func validateCredentials(username, password string, minPasswordLen int) error {
 		return fmt.Errorf("password must be at most %d characters", passwordMaxLen)
 	}
 	return nil
+}
+
+// me returns the authenticated user's profile.
+func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
+	id, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respond.Error(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	u, err := h.repo.ByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			respond.Error(w, http.StatusUnauthorized, "unauthorized", "account no longer exists")
+			return
+		}
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not load profile", err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, u.Public())
+}
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// verifyPassword loads the caller and checks password, writing the response on
+// failure. A wrong password is a 403 (the caller is authenticated, so 401
+// would wrongly make clients try to refresh their token).
+func (h *Handler) verifyPassword(w http.ResponseWriter, r *http.Request, password string) (User, bool) {
+	id, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respond.Error(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return User{}, false
+	}
+	u, err := h.repo.ByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			respond.Error(w, http.StatusUnauthorized, "unauthorized", "account no longer exists")
+			return User{}, false
+		}
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not verify password", err)
+		return User{}, false
+	}
+	if err := auth.CompareHashAndPassword(u.PasswordHash, password); err != nil {
+		respond.Error(w, http.StatusForbidden, "forbidden", "current password is incorrect")
+		return User{}, false
+	}
+	return u, true
+}
+
+// changePassword sets a new password, signs out every session (including this
+// one) and returns a fresh token pair for the calling device.
+func (h *Handler) changePassword(w http.ResponseWriter, r *http.Request) {
+	var req changePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respond.Error(w, http.StatusBadRequest, "bad_request", "malformed JSON body")
+		return
+	}
+	if len(req.NewPassword) < passwordMinLen || len(req.NewPassword) > passwordMaxLen {
+		respond.Error(w, http.StatusBadRequest, "validation",
+			fmt.Sprintf("new password must be %d-%d characters", passwordMinLen, passwordMaxLen))
+		return
+	}
+	if req.NewPassword == req.CurrentPassword {
+		respond.Error(w, http.StatusBadRequest, "validation", "new password must differ from the current one")
+		return
+	}
+	u, ok := h.verifyPassword(w, r, req.CurrentPassword)
+	if !ok {
+		return
+	}
+	hash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not change password", err)
+		return
+	}
+	if err := h.repo.UpdatePassword(r.Context(), u.ID, hash); err != nil {
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not change password", err)
+		return
+	}
+	// A password change must evict anyone holding a stolen refresh token.
+	if err := h.refresh.RevokeAllSessions(r.Context(), u.ID); err != nil {
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not change password", err)
+		return
+	}
+	resp, _, err := h.mintPair(r.Context(), u, uuid.New())
+	if err != nil {
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not change password", err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, resp)
+}
+
+type deleteAccountRequest struct {
+	Password string `json:"password"`
+}
+
+// deleteAccount permanently deletes the account after re-verifying the
+// password. Refresh tokens cascade with the user row, so no session survives.
+func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	var req deleteAccountRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respond.Error(w, http.StatusBadRequest, "bad_request", "malformed JSON body")
+		return
+	}
+	u, ok := h.verifyPassword(w, r, req.Password)
+	if !ok {
+		return
+	}
+	if err := h.repo.Delete(r.Context(), u.ID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			respond.JSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			return
+		}
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not delete account", err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) {
+	id, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respond.Error(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	sessions, err := h.refresh.ListSessions(r.Context(), id)
+	if err != nil {
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not list sessions", err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, sessions)
+}
+
+func (h *Handler) revokeSession(w http.ResponseWriter, r *http.Request) {
+	id, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respond.Error(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	family, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "bad_request", "session id must be a valid UUID")
+		return
+	}
+	found, err := h.refresh.RevokeSession(r.Context(), id, family)
+	if err != nil {
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not revoke session", err)
+		return
+	}
+	if !found {
+		respond.Error(w, http.StatusNotFound, "not_found", "session not found")
+		return
+	}
+	respond.JSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+func (h *Handler) revokeAllSessions(w http.ResponseWriter, r *http.Request) {
+	id, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respond.Error(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if err := h.refresh.RevokeAllSessions(r.Context(), id); err != nil {
+		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not revoke sessions", err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }

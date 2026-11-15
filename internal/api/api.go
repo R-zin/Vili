@@ -82,11 +82,12 @@ func NewRouter(
 		mux.Handle("/debug/pprof/", mw.Pprof)
 	}
 
-	// Public auth routes, wrapped in the per-IP limiter when configured.
-	users.RegisterRoutes(mux, mw.AuthLimit)
-
 	// Protected feature routes, mounted behind the shared auth middleware.
 	require := tokens.Require
+
+	// Auth routes: public ones wrapped in the per-IP limiter when configured,
+	// plus the protected /v1/me account routes.
+	users.RegisterRoutes(mux, mw.AuthLimit, require)
 	rooms.RegisterRoutes(mux, require)
 	messages.RegisterRoutes(mux, require, mw.MessageLimit)
 	if realtime != nil {

@@ -31,6 +31,10 @@ type Client struct {
 	// TokenExpiry is when Token expires (from the login/refresh response).
 	TokenExpiry time.Time
 
+	// Username is the signed-in user's name (from the saved session), used to
+	// flag @mentions in rendered messages. Empty when unknown.
+	Username string
+
 	// OnTokenRefresh is called after a successful silent renewal so the caller
 	// can persist the rotated token pair. Nil disables silent renewal.
 	OnTokenRefresh func(access, refresh string, expiry time.Time)
@@ -192,6 +196,10 @@ func (c *Client) applySession(resp loginResponse) {
 	}
 }
 
+// esc escapes a value for use as a single URL path segment, so a user-supplied
+// id like "../x" cannot rewrite the request path.
+func esc(s string) string { return url.PathEscape(s) }
+
 // credentials is the shared register/login request body.
 type credentials struct {
 	Username string `json:"username"`
@@ -224,29 +232,124 @@ func (c *Client) Logout(ctx context.Context) error {
 		map[string]string{"refresh_token": c.RefreshToken}, nil)
 }
 
-// CreateRoom creates a room owned by the authenticated user.
+// CreateRoom creates a public room owned by the authenticated user.
 func (c *Client) CreateRoom(ctx context.Context, name, description string) (Room, error) {
+	return c.CreateRoomPrivate(ctx, name, description, false)
+}
+
+// CreateRoomPrivate creates a room, optionally private (invite-only).
+func (c *Client) CreateRoomPrivate(ctx context.Context, name, description string, private bool) (Room, error) {
 	var r Room
-	body := map[string]string{"name": name, "description": description}
+	body := map[string]any{"name": name, "description": description, "is_private": private}
 	err := c.do(ctx, http.MethodPost, "/v1/createroom", nil, body, &r)
 	return r, err
 }
 
-// ListRooms returns all rooms, newest first.
+// ListRooms returns the rooms visible to the user, newest first.
 func (c *Client) ListRooms(ctx context.Context) ([]Room, error) {
+	return c.ListRoomsFiltered(ctx, "", false)
+}
+
+// ListRoomsFiltered lists rooms matching a name query, optionally only those
+// the user belongs to. Results carry the user's role and unread counters.
+func (c *Client) ListRoomsFiltered(ctx context.Context, query string, mine bool) ([]Room, error) {
+	q := url.Values{}
+	if query != "" {
+		q.Set("q", query)
+	}
+	if mine {
+		q.Set("mine", "1")
+	}
 	var rooms []Room
-	err := c.do(ctx, http.MethodGet, "/v1/listrooms", nil, nil, &rooms)
+	err := c.do(ctx, http.MethodGet, "/v1/listrooms", q, nil, &rooms)
 	return rooms, err
+}
+
+// MarkRead advances the user's read cursor in a room to now.
+func (c *Client) MarkRead(ctx context.Context, roomID string) error {
+	return c.do(ctx, http.MethodPost, "/v1/rooms/"+esc(roomID)+"/read", nil, nil, &statusResponse{})
+}
+
+// Members lists a room's members.
+func (c *Client) Members(ctx context.Context, roomID string) ([]Member, error) {
+	var ms []Member
+	err := c.do(ctx, http.MethodGet, "/v1/rooms/"+esc(roomID)+"/members", nil, nil, &ms)
+	return ms, err
+}
+
+// Kick removes a member from a room (owner/admin).
+func (c *Client) Kick(ctx context.Context, roomID, userID string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/rooms/"+esc(roomID)+"/members/"+esc(userID), nil, nil, &statusResponse{})
+}
+
+// SetRole promotes/demotes a member (owner only): role is admin or member.
+func (c *Client) SetRole(ctx context.Context, roomID, userID, role string) error {
+	return c.do(ctx, http.MethodPut, "/v1/rooms/"+esc(roomID)+"/members/"+esc(userID)+"/role", nil,
+		map[string]string{"role": role}, &statusResponse{})
+}
+
+// RoomUpdate carries the optional fields of a room edit; nil is "unchanged".
+type RoomUpdate struct {
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
+	IsPrivate   *bool   `json:"is_private,omitempty"`
+}
+
+// UpdateRoom edits a room.
+func (c *Client) UpdateRoom(ctx context.Context, roomID string, u RoomUpdate) (Room, error) {
+	var r Room
+	err := c.do(ctx, http.MethodPatch, "/v1/rooms/"+esc(roomID), nil, u, &r)
+	return r, err
+}
+
+// DeleteRoom deletes a room (owner only).
+func (c *Client) DeleteRoom(ctx context.Context, roomID string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/rooms/"+esc(roomID), nil, nil, &statusResponse{})
+}
+
+// CreateInvite mints an invite code; maxUses 0 and ttlHours 0 mean the server
+// defaults (unlimited uses, 7 days).
+func (c *Client) CreateInvite(ctx context.Context, roomID string, maxUses, ttlHours int) (string, Invite, error) {
+	var resp createInviteResponse
+	err := c.do(ctx, http.MethodPost, "/v1/rooms/"+esc(roomID)+"/invites", nil,
+		map[string]int{"max_uses": maxUses, "ttl_hours": ttlHours}, &resp)
+	return resp.Code, resp.Invite, err
+}
+
+// ListInvites lists a room's invites.
+func (c *Client) ListInvites(ctx context.Context, roomID string) ([]Invite, error) {
+	var invs []Invite
+	err := c.do(ctx, http.MethodGet, "/v1/rooms/"+esc(roomID)+"/invites", nil, nil, &invs)
+	return invs, err
+}
+
+// RevokeInvite revokes an invite.
+func (c *Client) RevokeInvite(ctx context.Context, roomID, inviteID string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/rooms/"+esc(roomID)+"/invites/"+esc(inviteID), nil, nil, &statusResponse{})
+}
+
+// RedeemInvite joins the room an invite code belongs to.
+func (c *Client) RedeemInvite(ctx context.Context, code string) (Room, error) {
+	var r Room
+	err := c.do(ctx, http.MethodPost, "/v1/invites/redeem", nil, map[string]string{"code": code}, &r)
+	return r, err
+}
+
+// OpenDM finds or creates a direct-message room with another user.
+func (c *Client) OpenDM(ctx context.Context, username string) (Room, error) {
+	var r Room
+	err := c.do(ctx, http.MethodPost, "/v1/dms", nil, map[string]string{"username": username}, &r)
+	return r, err
 }
 
 // Join adds the authenticated user to the room as a member.
 func (c *Client) Join(ctx context.Context, roomID string) error {
-	return c.do(ctx, http.MethodPost, "/v1/rooms/"+roomID+"/join", nil, nil, &statusResponse{})
+	return c.do(ctx, http.MethodPost, "/v1/rooms/"+esc(roomID)+"/join", nil, nil, &statusResponse{})
 }
 
 // Leave removes the authenticated user from the room.
 func (c *Client) Leave(ctx context.Context, roomID string) error {
-	return c.do(ctx, http.MethodPost, "/v1/rooms/"+roomID+"/leave", nil, nil, &statusResponse{})
+	return c.do(ctx, http.MethodPost, "/v1/rooms/"+esc(roomID)+"/leave", nil, nil, &statusResponse{})
 }
 
 // History fetches up to limit messages for a room, oldest first. before
@@ -258,20 +361,92 @@ func (c *Client) History(ctx context.Context, roomID string, limit int, before *
 		q.Set("limit", fmt.Sprintf("%d", limit))
 	}
 	if before != nil {
-		q.Set("before", before.UTC().Format(time.RFC3339))
+		q.Set("before", before.UTC().Format(time.RFC3339Nano))
 	}
 	var messages []Message
-	err := c.do(ctx, http.MethodGet, "/v1/rooms/"+roomID+"/messages", q, nil, &messages)
+	err := c.do(ctx, http.MethodGet, "/v1/rooms/"+esc(roomID)+"/messages", q, nil, &messages)
 	return messages, err
 }
 
 // SendMessage posts content to a room as the authenticated user.
 func (c *Client) SendMessage(ctx context.Context, roomID, content, typ string) (Message, error) {
+	return c.SendReply(ctx, roomID, content, typ, "")
+}
+
+// SendReply posts content as a reply to another message (replyTo may be empty).
+func (c *Client) SendReply(ctx context.Context, roomID, content, typ, replyTo string) (Message, error) {
 	var m Message
 	body := map[string]string{"content": content}
 	if typ != "" {
 		body["type"] = typ
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/rooms/"+roomID+"/messages", nil, body, &m)
+	if replyTo != "" {
+		body["reply_to"] = replyTo
+	}
+	err := c.do(ctx, http.MethodPost, "/v1/rooms/"+esc(roomID)+"/messages", nil, body, &m)
 	return m, err
+}
+
+// EditMessage replaces the content of one of the user's own messages.
+func (c *Client) EditMessage(ctx context.Context, roomID, msgID, content string) (Message, error) {
+	var m Message
+	err := c.do(ctx, http.MethodPatch, "/v1/rooms/"+esc(roomID)+"/messages/"+esc(msgID), nil,
+		map[string]string{"content": content}, &m)
+	return m, err
+}
+
+// DeleteMessage deletes a message (own, or any as room owner/admin).
+func (c *Client) DeleteMessage(ctx context.Context, roomID, msgID string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/rooms/"+esc(roomID)+"/messages/"+esc(msgID), nil, nil, &statusResponse{})
+}
+
+// Search runs a full-text search over the user's rooms (roomID optional).
+func (c *Client) Search(ctx context.Context, query, roomID string, limit int) ([]Message, error) {
+	q := url.Values{"q": {query}}
+	if roomID != "" {
+		q.Set("room_id", roomID)
+	}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	var ms []Message
+	err := c.do(ctx, http.MethodGet, "/v1/search", q, nil, &ms)
+	return ms, err
+}
+
+// Me returns the authenticated user's profile.
+func (c *Client) Me(ctx context.Context) (User, error) {
+	var u User
+	err := c.do(ctx, http.MethodGet, "/v1/me", nil, nil, &u)
+	return u, err
+}
+
+// ChangePassword sets a new password and returns the fresh session (every
+// other session is signed out by the server).
+func (c *Client) ChangePassword(ctx context.Context, current, next string) (loginResponse, error) {
+	var resp loginResponse
+	err := c.do(ctx, http.MethodPost, "/v1/me/password", nil,
+		map[string]string{"current_password": current, "new_password": next}, &resp)
+	return resp, err
+}
+
+// DeleteAccount permanently deletes the account.
+func (c *Client) DeleteAccount(ctx context.Context, password string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/me", nil, map[string]string{"password": password}, &statusResponse{})
+}
+
+// ListSessions lists the user's signed-in sessions.
+func (c *Client) ListSessions(ctx context.Context) ([]SessionInfo, error) {
+	var ss []SessionInfo
+	err := c.do(ctx, http.MethodGet, "/v1/me/sessions", nil, nil, &ss)
+	return ss, err
+}
+
+// RevokeSession signs out one session; id "" signs out all of them.
+func (c *Client) RevokeSession(ctx context.Context, id string) error {
+	path := "/v1/me/sessions"
+	if id != "" {
+		path += "/" + esc(id)
+	}
+	return c.do(ctx, http.MethodDelete, path, nil, nil, &statusResponse{})
 }

@@ -16,6 +16,11 @@ primary_region = "iad"
 
 [env]
   PORT = "8080"
+  # Fly's edge proxy connects over the private network and sets Fly-Client-IP.
+  # Trust only that network so per-IP rate limits key on the real client rather
+  # than the proxy. Verify these ranges against your org's network before
+  # relying on them; with this unset every client shares one auth bucket.
+  TRUSTED_PROXIES = "172.16.0.0/12,fdaa::/16"
   # Fail-fast config pairs with the distroless image: if a required secret is
   # missing the process exits and fly restarts it, surfacing the misconfig.
   # All other limits (rate limiting, body cap, timeouts) ship as tuned defaults;

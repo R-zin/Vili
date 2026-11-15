@@ -25,21 +25,22 @@ auth, users, rooms, membership, and messages; the CLI stays a thin, opinionated 
 
 ## Status
 
-**Phases 1–5: backend + CLI + real-time delivery + production hardening, complete and green.**
-The HTTP API, authentication, room and message persistence, migrations, and a full no-DB
-unit-test suite are done. **Message history and posting are membership-gated.** The `vili`
-terminal CLI signs in with a saved session, browses rooms, and chats in a **live view**:
-messages, presence, and typing arrive over WebSocket as they happen (no Enter needed),
-with automatic fallback to polling when the socket can't be established.
-Phase 5 adds **hardening, observability, and rate limiting** plus a Docker/fly deployment
-path and a **Homebrew install**. See [Deployment](#deployment), [Install (Homebrew)](#install-homebrew),
-and [Security](#security).
+**Phases 1–6: backend + CLI + real-time delivery + production hardening + the collaboration layer, complete and green.**
+Beyond accounts, rooms and live chat, Vili now has **private rooms with invite codes, room moderation
+(owner/admin roles), unread counts and read cursors, @mentions, message replies/edit/delete, full-text search,
+direct messages, and account lifecycle management** (password change, session management, account deletion).
+See [Deployment](#deployment), [Install (Homebrew)](#install-homebrew), and [Security](#security).
 
 ## Features
 
 - **Accounts & auth** — register/login, bcrypt password hashing, short-lived **JWT (HS256)** access tokens with a hardened verification path (no algorithm confusion, no panicking claim assertions, fail-fast on an empty secret).
-- **Rooms & membership** — create/list rooms, join/leave, owner/member roles. Message history is **membership-gated** by the backend.
-- **Messages** — persisted in PostgreSQL, typed payloads (`text`, `diff`, `code`, `log`, `commit`), cursor-paginated history (`before` + `limit`).
+- **Rooms & membership** — public and **private (invite-only)** rooms, join/leave, `owner`/`admin`/`member` roles, member listing, kick, promote/demote, rename, delete. Private rooms are invisible to non-members (same `404` as an unknown room). When the last owner leaves, ownership passes on; an emptied room is deleted.
+- **Invites** — unguessable (96-bit) codes, stored only as SHA-256 digests; optional max-uses and expiry; revocable; redemption is atomic so concurrent users cannot exceed `max_uses`.
+- **Messages** — persisted in PostgreSQL, typed payloads (`text`, `diff`, `code`, `log`, `commit`), cursor-paginated history (`before` + `limit`), **replies**, **edit**, **delete** (tombstoned; content erased; room owners/admins can moderate), **@mentions** (resolved to real room members, capped per message).
+- **Unread & mentions** — per-member read cursors; room listings carry `unread` and `unread_mentions` counters.
+- **Search** — Postgres full-text search (`websearch` syntax) over messages in rooms you belong to.
+- **Direct messages** — private two-person rooms, find-or-create and symmetric.
+- **Account lifecycle** — `GET /v1/me`, change password (signs out every other session), list/revoke sessions, delete account. A background janitor purges expired refresh tokens and invites.
 - **Real-time** — membership-gated WebSocket delivery (messages, presence, typing) with a per-user concurrent-connection cap.
 - **Hardening** — security headers, JSON body-size caps, panic-recovery to a uniform 500 envelope, explicit deny-by-default CORS, and per-IP / per-user token-bucket rate limiting (`429` + `Retry-After`).
 - **Observability** — structured `log/slog` access logs (never tokens or bodies), a hand-rolled Prometheus `/metrics` endpoint, and `net/http/pprof` behind a default-off flag.
@@ -122,14 +123,29 @@ at a running server, and sign in (the session is saved to `~/.config/vili/sessio
 ```bash
 go build -o vili ./cmd/vili
 
-./vili register dev supersecret
+./vili register dev supersecret     # (or: echo supersecret | ./vili register dev)
 ./vili login dev supersecret        # saves token + user to the session
 ./vili create general "watercooler"
-./vili rooms                        # note a room id
+./vili create vault "secrets" --private   # invite-only
+./vili rooms                        # rooms + your unread counts; note a room id
 ./vili join <room-id>               # (a creator is already a member)
-./vili send <room-id> hello world
-./vili history <room-id>
+./vili send <room-id> hello @alice  # @mentions notify members
+git diff | ./vili send <room-id> --file - --type diff
+./vili history <room-id> --ids      # --ids shows message ids for reply/edit/delete
+./vili send <room-id> "agreed" --reply <message-id>
+./vili edit <room-id> <message-id> "fixed typo"
+./vili search "deploy failed"
 ./vili chat <room-id>               # live view: realtime messages/presence/typing; /quit to exit
+
+# collaboration
+./vili invite <room-id> --uses 5    # prints a one-time code
+./vili redeem <code>                # join a private room with a code
+./vili members <room-id>; ./vili promote <room-id> bob; ./vili kick <room-id> mallory
+./vili dm bob                       # direct message
+./vili unread                       # rooms with unread messages
+
+# account
+./vili whoami; ./vili sessions; ./vili passwd <current> <new>
 ```
 
 `--server URL` selects a backend (default `http://localhost:8080`; saved on login).
@@ -151,12 +167,31 @@ All endpoints are versioned under `/v1`. Protected routes require
 | POST | `/v1/auth/login` | — | Authenticate → `200 {token, refresh_token, expires_at, user}` |
 | POST | `/v1/auth/refresh` | — | Exchange a refresh token for a rotated token pair → `200 {token, refresh_token, expires_at, user}`. Reusing a consumed token revokes the whole family → `401`. |
 | POST | `/v1/auth/logout` | — | Revoke a refresh token (idempotent — `200` even for an unknown token) |
-| POST | `/v1/createroom` | ✔ | Create a room (creator becomes owner) → `201` |
-| GET | `/v1/listrooms` | ✔ | List rooms → `200` |
 | POST | `/v1/rooms/{id}/join` | ✔ | Join a room (member role) → `200` |
 | POST | `/v1/rooms/{id}/leave` | ✔ | Leave a room → `200` |
 | GET | `/v1/rooms/{id}/messages` | ✔ | Room history (`?limit=` 1–100, `?before=` RFC3339) → `200`. **Members only.** |
-| POST | `/v1/rooms/{id}/messages` | ✔ | Post a message `{content, type?}` → `201`. **Members only.** Broadcast to the room's live connections. Per-user rate limit → `429`. |
+| POST | `/v1/rooms/{id}/messages` | ✔ | Post a message `{content, type?, reply_to?}` → `201` (`reply_to` must be a message in the same room). **Members only.** Broadcast to the room's live connections. Per-user rate limit → `429`. |
+| GET | `/v1/listrooms` | ✔ | `?q=` name filter, `?mine=1`, `?limit=`. Returns public rooms + your private rooms with `role`, `member_count`, `unread`, `unread_mentions`, and `peer` for DMs. |
+| POST | `/v1/createroom` | ✔ | Create a room (creator becomes owner) → `201`; body `{name, description, is_private}`; name/description validated, `dm:` prefix reserved. |
+| PATCH | `/v1/rooms/{id}` | ✔ admin+ | Edit `name`/`description`; `is_private` is owner-only |
+| DELETE | `/v1/rooms/{id}` | ✔ owner | Delete a room (closes its live sockets) |
+| POST | `/v1/rooms/{id}/read` | ✔ | Advance your read cursor to now |
+| GET | `/v1/rooms/{id}/members` | ✔ | List members (`user_id, username, role, joined_at`) |
+| DELETE | `/v1/rooms/{id}/members/{userID}` | ✔ admin+ | Kick a member (never one of equal/higher rank); closes their sockets |
+| PUT | `/v1/rooms/{id}/members/{userID}/role` | ✔ owner | `{role: admin\|member}` |
+| POST | `/v1/rooms/{id}/invites` | ✔ admin+ | `{max_uses?, ttl_hours?}` → `201 {code, invite}`; the code is shown **once** |
+| GET | `/v1/rooms/{id}/invites` | ✔ admin+ | List invites (never the codes) |
+| DELETE | `/v1/rooms/{id}/invites/{inviteID}` | ✔ admin+ | Revoke |
+| POST | `/v1/invites/redeem` | ✔ | `{code}` → join the room (invalid/expired/used-up → `404`; already a member → `409`) |
+| POST | `/v1/dms` | ✔ | `{username}` → find-or-create the DM room |
+| PATCH | `/v1/rooms/{id}/messages/{msgID}` | ✔ author | `{content}` — edit your own message; rate-limited like posting |
+| DELETE | `/v1/rooms/{id}/messages/{msgID}` | ✔ author or admin+ | Tombstone a message |
+| GET | `/v1/search` | ✔ | `?q=` (required), `?room_id=`, `?limit=` — full-text over your rooms |
+| GET | `/v1/me` | ✔ | Your profile |
+| POST | `/v1/me/password` | ✔ | `{current_password, new_password}` → fresh token pair; every other session is revoked. Per-IP limited. |
+| DELETE | `/v1/me` | ✔ | `{password}` — permanently delete the account. Per-IP limited. |
+| GET | `/v1/me/sessions` | ✔ | List signed-in devices |
+| DELETE | `/v1/me/sessions[/{id}]` | ✔ | Revoke one / all sessions |
 | GET | `/v1/rooms/{id}/ws` | ✔ | Real-time WebSocket upgrade (messages, presence, typing). **Members only.** Per-user connection cap → `429`. See [Real-time](#real-time). |
 
 Cross-cutting behavior worth knowing:
@@ -187,13 +222,15 @@ on REST.
 **Event envelope** (JSON, one per frame):
 
 ```json
-{ "type": "message.new|presence.state|presence.join|presence.leave|typing",
+{ "type": "message.new|message.edited|message.deleted|presence.state|presence.join|presence.leave|typing",
   "room_id": "<uuid>", "payload": { … } }
 ```
 
 | Type | Direction | Payload | Meaning |
 |---|---|---|---|
 | `message.new` | server → room | a message object | a member posted; render it |
+| `message.edited` | server → room | the updated message object | a message was edited |
+| `message.deleted` | server → room | `{ "id": "<uuid>" }` | a message was deleted (render a tombstone) |
 | `presence.state` | server → connecting client | `{ "online": ["alice","bob"] }` | who's here now (sent on connect) |
 | `presence.join` / `presence.leave` | server → room | `{ "username": "alice" }` | a member connected / disconnected |
 | `typing` | client → server → room | `{ "username": "alice" }` | ephemeral "typing…" relay (never persisted), throttled |
@@ -203,6 +240,8 @@ immediately (no Enter), presence join/leave and typing show as transient lines. 
 socket can't be opened it falls back to the original polling loop. Open the bundled
 `index.html` in a browser for a zero-install second client to watch realtime in action
 (paste a JWT from `vili login`, the server URL, and a room id).
+
+Kicking a member, a member leaving, or deleting a room **closes the affected live sockets immediately**.
 
 ## Configuration
 
@@ -228,6 +267,7 @@ server exits non-zero if either is missing/empty.
 | `MAX_BODY_BYTES` | — | `1048576` (1 MiB) | Max bytes for any JSON request body |
 | `SECURITY_HEADERS_ENABLED` | — | `true` | Send security headers on every response |
 | `CORS_ALLOWED_ORIGINS` | — | _(empty)_ | Comma-separated cross-origin allowlist; empty = deny-by-default |
+| `TRUSTED_PROXIES` | — | _(empty)_ | CIDRs/IPs of reverse proxies whose `Fly-Client-IP` / `X-Forwarded-For` are believed for per-IP rate limiting. Empty = trust none (the TCP peer is used). **Set this behind a proxy** or every client shares one auth bucket. |
 | `RATE_LIMIT_ENABLED` | — | `true` | Master switch for token-bucket limiting |
 | `RATE_LIMIT_AUTH_RPS` | — | `5` | Sustained req/s per IP on `/v1/auth/*` |
 | `RATE_LIMIT_AUTH_BURST` | — | `10` | Burst size per IP on `/v1/auth/*` |
@@ -248,12 +288,13 @@ server exits non-zero if either is missing/empty.
 - **Headers**: every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a restrictive `Content-Security-Policy`.
 - **Recovery**: a handler panic is caught and returned as the uniform `500` envelope (with the stack logged server-side), never a dropped connection.
 - **CORS**: deny-by-default. No `Access-Control-Allow-Origin` is emitted unless the request `Origin` is in `CORS_ALLOWED_ORIGINS`. The CLI sends no `Origin` header and the `index.html` demo is opened as a local file, so neither needs a browser CORS grant.
-- **Rate limiting**: token-bucket limiters (per-IP on `/v1/auth/*`, per-user on message POST) return `429` + `Retry-After` when exceeded; WebSocket connections are capped per user. Buckets are evicted when idle so a spoofed-IP flood can't grow memory unboundedly; `X-Forwarded-For` is ignored for keying (no trusted-proxy config, so it's spoofable).
+- **Authorization**: room roles are enforced server-side (`owner` > `admin` > `member`); non-members and private rooms answer with the same `404` as unknown rooms. Invite codes and refresh tokens are stored only as digests. Password change/account deletion re-verify the current password and are rate-limited per IP; a password change revokes every other session.
+- **Rate limiting**: token-bucket limiters (per-IP on `/v1/auth/*`, per-user on message POST) return `429` + `Retry-After` when exceeded; WebSocket connections are capped per user. Buckets are evicted when idle so a spoofed-IP flood can't grow memory unboundedly; forwarded headers are honored **only** from peers in `TRUSTED_PROXIES`, so a client cannot spoof its way out of a limit.
 
 ## Observability
 
 - **Access logs** — one structured `log/slog` line per request with `method`, `route` (the mux pattern, e.g. `/v1/rooms/{id}/messages`), `status`, and `duration_ms`. Toggle with `REQUEST_LOG_ENABLED`.
-- **Metrics** — `GET /metrics` serves hand-rolled Prometheus text (no client dependency): `vili_http_requests_in_flight` (gauge), `vili_http_requests_total{method,route,status_class}` (counter), and `vili_http_request_duration_seconds{method,route}` (histogram). Toggle with `METRICS_ENABLED`. Scrape it with any Prometheus-compatible collector.
+- **Metrics** — `GET /metrics` serves hand-rolled Prometheus text (no client dependency): `vili_http_requests_in_flight` (gauge), `vili_http_requests_total{method,route,status_class}` (counter), and `vili_http_request_duration_seconds{method,route}` (histogram), `vili_ws_connections` and `vili_ws_active_rooms` (gauges). Toggle with `METRICS_ENABLED`. Scrape it with any Prometheus-compatible collector.
 - **Profiling** — `net/http/pprof` under `/debug/pprof/*`, mounted **only** when `PPROF_ENABLED=true` (default off). Profiles expose goroutine stacks, heap, and traces; enable only in a trusted environment.
 
 ## Deployment
@@ -331,7 +372,8 @@ Current green gate for CI: `go build ./...`, `go vet ./...`, `gofmt -l .` empty,
 - [x] **Phase 3** — CLI client: login/session persistence, room browsing, message send, interactive chat view (poll-based)
 - [x] **Phase 4** — real-time messaging (WebSocket), presence, typing indicators; live CLI chat view
 - [x] **Phase 5** — production hardening (security headers, body caps, panic recovery, deny-by-default CORS), observability (access logs, `/metrics`, gated pprof), rate limiting (per-IP/per-user token buckets + a WS connection cap), Docker/fly deployment, **Homebrew distribution**
-- [x] **Phase 6 (started)** — account lifecycle: refresh-token rotation with family reuse-detection and server-side logout. CLI sessions renew silently. _In progress: unread counts, @mentions, private rooms + invite codes._
+- [x] **Phase 6** — collaboration & account lifecycle: refresh-token rotation + server-side logout; private rooms + invite codes; room moderation (kick/promote/edit/delete); unread counts and read cursors; @mentions; replies, edit, delete; full-text search; direct messages; `/v1/me`, password change, session management, account deletion; trusted-proxy-aware rate limiting; WS metrics; expired-token janitor; end-to-end CLI test in CI.
+- [ ] **Next** — multi-instance realtime fan-out (Postgres `LISTEN/NOTIFY` or Redis; the hub is in-memory today, so run a single instance), incoming webhooks / bot tokens, per-username login throttling, full-screen TUI, email verification, message retention policy.
 
 ## Built with
 

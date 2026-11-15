@@ -175,3 +175,72 @@ func (r *PostgresRepository) RevokeRefreshToken(ctx context.Context, hash string
 	}
 	return nil
 }
+
+// UpdatePassword replaces the user's password hash.
+func (r *PostgresRepository) UpdatePassword(ctx context.Context, id uuid.UUID, passwordHash string) error {
+	res, err := r.db.ExecContext(ctx, `UPDATE users SET password_hash = $2 WHERE id = $1`, id, passwordHash)
+	if err != nil {
+		return fmt.Errorf("user: update password: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Delete removes the user; memberships, messages, refresh tokens and invites
+// cascade.
+func (r *PostgresRepository) Delete(ctx context.Context, id uuid.UUID) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM users WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("user: delete: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListSessions returns the user's live sessions, most recently active first.
+func (r *PostgresRepository) ListSessions(ctx context.Context, userID uuid.UUID) ([]auth.Session, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT family_id, min(created_at), max(created_at), max(expires_at)
+		FROM refresh_tokens
+		WHERE user_id = $1
+		GROUP BY family_id
+		HAVING bool_or(consumed_at IS NULL AND expires_at > now())
+		ORDER BY max(created_at) DESC
+		LIMIT 100`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("user: list sessions: %w", err)
+	}
+	defer rows.Close()
+	out := make([]auth.Session, 0)
+	for rows.Next() {
+		var s auth.Session
+		if err := rows.Scan(&s.ID, &s.CreatedAt, &s.LastActive, &s.ExpiresAt); err != nil {
+			return nil, fmt.Errorf("user: list sessions scan: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// RevokeSession deletes one session (token family) owned by userID.
+func (r *PostgresRepository) RevokeSession(ctx context.Context, userID, familyID uuid.UUID) (bool, error) {
+	res, err := r.db.ExecContext(ctx,
+		`DELETE FROM refresh_tokens WHERE user_id = $1 AND family_id = $2`, userID, familyID)
+	if err != nil {
+		return false, fmt.Errorf("user: revoke session: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// RevokeAllSessions deletes every refresh token of the user.
+func (r *PostgresRepository) RevokeAllSessions(ctx context.Context, userID uuid.UUID) error {
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM refresh_tokens WHERE user_id = $1`, userID); err != nil {
+		return fmt.Errorf("user: revoke all sessions: %w", err)
+	}
+	return nil
+}

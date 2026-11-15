@@ -62,3 +62,20 @@ func TestRenderEmpty(t *testing.T) {
 		t.Errorf("empty registry should still render the gauge, got:\n%s", sb.String())
 	}
 }
+
+func TestGaugeFuncRendered(t *testing.T) {
+	r := New()
+	n := 3.0
+	r.GaugeFunc("vili_test_gauge", "A test gauge.", func() float64 { return n })
+	var b strings.Builder
+	r.Render(&b)
+	if !strings.Contains(b.String(), "# TYPE vili_test_gauge gauge\nvili_test_gauge 3\n") {
+		t.Fatalf("gauge missing:\n%s", b.String())
+	}
+	n = 4.5 // sampled at scrape time, not registration time
+	b.Reset()
+	r.Render(&b)
+	if !strings.Contains(b.String(), "vili_test_gauge 4.5\n") {
+		t.Fatalf("gauge not re-sampled:\n%s", b.String())
+	}
+}

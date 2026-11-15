@@ -152,7 +152,7 @@ func TestRenderEventVariants(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			renderEvent(&out, tc.e)
+			renderEvent(&out, tc.e, "")
 			if !strings.Contains(out.String(), tc.want) {
 				t.Errorf("renderEvent(%s) = %q, want substring %q", tc.name, out.String(), tc.want)
 			}

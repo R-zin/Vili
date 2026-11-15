@@ -204,3 +204,77 @@ func TestUserRepository_Integration_RefreshTokens(t *testing.T) {
 		t.Fatalf("expected ErrRefreshNotFound after RevokeRefreshFamily, got %v", err)
 	}
 }
+
+func TestUserRepository_Integration_AccountLifecycle(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	repo := user.NewPostgresRepository(db)
+
+	u, err := repo.Create(ctx, fmt.Sprintf("acct_%d", time.Now().UnixNano()), "hash1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := repo.Create(ctx, fmt.Sprintf("acct_o_%d", time.Now().UnixNano()), "hash")
+
+	if err := repo.UpdatePassword(ctx, u.ID, "hash2"); err != nil {
+		t.Fatalf("UpdatePassword: %v", err)
+	}
+	if got, _ := repo.ByID(ctx, u.ID); got.PasswordHash != "hash2" {
+		t.Fatalf("hash not stored: %q", got.PasswordHash)
+	}
+	if err := repo.UpdatePassword(ctx, uuid.New(), "x"); !errors.Is(err, user.ErrNotFound) {
+		t.Fatalf("UpdatePassword unknown: %v", err)
+	}
+
+	// Sessions: two families for u (one with a consumed + a live token), one
+	// expired family, and one belonging to someone else.
+	famA, famB, famExpired, famOther := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	exp := time.Now().Add(time.Hour)
+	oldA, _ := repo.InsertRefreshToken(ctx, u.ID, famA, "ha1", exp)
+	newA, _ := repo.InsertRefreshToken(ctx, u.ID, famA, "ha2", exp)
+	if err := repo.ConsumeRefreshToken(ctx, oldA, newA); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = repo.InsertRefreshToken(ctx, u.ID, famB, "hb1", exp)
+	_, _ = repo.InsertRefreshToken(ctx, u.ID, famExpired, "he1", time.Now().Add(-time.Hour))
+	_, _ = repo.InsertRefreshToken(ctx, other.ID, famOther, "ho1", exp)
+
+	sessions, err := repo.ListSessions(ctx, u.ID)
+	if err != nil || len(sessions) != 2 {
+		t.Fatalf("ListSessions: %v %+v", err, sessions)
+	}
+	ids := map[uuid.UUID]bool{sessions[0].ID: true, sessions[1].ID: true}
+	if !ids[famA] || !ids[famB] {
+		t.Fatalf("expected families A and B, got %+v", sessions)
+	}
+	if found, err := repo.RevokeSession(ctx, u.ID, famOther); err != nil || found {
+		t.Fatalf("must not revoke another user's session: %v %v", found, err)
+	}
+	if found, err := repo.RevokeSession(ctx, u.ID, famA); err != nil || !found {
+		t.Fatalf("revoke A: %v %v", found, err)
+	}
+	if s, _ := repo.ListSessions(ctx, u.ID); len(s) != 1 || s[0].ID != famB {
+		t.Fatalf("after revoke: %+v", s)
+	}
+	if err := repo.RevokeAllSessions(ctx, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := repo.ListSessions(ctx, u.ID); len(s) != 0 {
+		t.Fatalf("after revoke all: %+v", s)
+	}
+	if s, _ := repo.ListSessions(ctx, other.ID); len(s) != 1 {
+		t.Fatal("other user's sessions must survive")
+	}
+
+	// Delete cascades to the user's tokens, and is not repeatable.
+	if err := repo.Delete(ctx, other.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := repo.RefreshTokenByHash(ctx, "ho1"); !errors.Is(err, auth.ErrRefreshNotFound) {
+		t.Fatalf("tokens must cascade: %v", err)
+	}
+	if err := repo.Delete(ctx, other.ID); !errors.Is(err, user.ErrNotFound) {
+		t.Fatalf("second delete: %v", err)
+	}
+}

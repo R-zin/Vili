@@ -26,8 +26,24 @@ type Registry struct {
 	inFlight atomic.Int64
 
 	mu sync.Mutex
+	// gauges are sampled at scrape time.
+	gauges []gaugeFunc
 	// requests counts completed requests, keyed by the route label set.
 	requests map[routeKey]*routeSeries
+}
+
+// gaugeFunc is a gauge whose value is read from fn each time /metrics renders.
+type gaugeFunc struct {
+	name, help string
+	fn         func() float64
+}
+
+// GaugeFunc registers a gauge sampled at scrape time. name should follow the
+// vili_* convention; it is emitted verbatim, so it must be a valid metric name.
+func (r *Registry) GaugeFunc(name, help string, fn func() float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gauges = append(r.gauges, gaugeFunc{name: name, help: help, fn: fn})
 }
 
 // routeKey identifies one (method, route, status-class) time series.
@@ -116,6 +132,7 @@ func (r *Registry) Render(w io.Writer) {
 		}
 		return a.class < b.class
 	})
+	gauges := append([]gaugeFunc(nil), r.gauges...)
 	series := make(map[routeKey]routeSeries, len(r.requests))
 	for _, k := range keys {
 		s := r.requests[k]
@@ -128,6 +145,12 @@ func (r *Registry) Render(w io.Writer) {
 	fmt.Fprintf(w, "# HELP vili_http_requests_in_flight Current in-flight HTTP requests.\n")
 	fmt.Fprintf(w, "# TYPE vili_http_requests_in_flight gauge\n")
 	fmt.Fprintf(w, "vili_http_requests_in_flight %d\n", r.inFlight.Load())
+
+	sort.Slice(gauges, func(i, j int) bool { return gauges[i].name < gauges[j].name })
+	for _, g := range gauges {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %s\n", g.name, g.help, g.name, g.name,
+			strconv.FormatFloat(g.fn(), 'f', -1, 64))
+	}
 
 	fmt.Fprintf(w, "# HELP vili_http_requests_total Completed HTTP requests by method, route, and status class.\n")
 	fmt.Fprintf(w, "# TYPE vili_http_requests_total counter\n")
