@@ -27,19 +27,47 @@ const usage = `vili — terminal client for the Vili chat backend
 Usage:
   vili [--server URL] <command> [args]
 
-Commands:
-  register <username> <password>     create an account
-  login <username> <password>        sign in and save the session
+Account:
+  register <username> [password]     create an account (password may be piped on stdin)
+  login <username> [password]        sign in and save the session
   logout                             clear the saved session
-  rooms                              list all rooms
-  create <name> [description]        create a room (you become owner)
-  join <room-id>                     join a room
+  whoami                             show the signed-in account
+  passwd <current> [new]             change password (signs out other sessions)
+  sessions [revoke <id> | revoke-all]  list or sign out devices
+  delete-account [password] --yes    permanently delete your account
+
+Rooms:
+  rooms [--mine] [--search NAME]     list rooms (with unread counts for yours)
+  unread                             only rooms with unread messages
+  create <name> [description] [--private]
+                                     create a room (you become owner)
+  join <room-id>                     join a public room
   leave <room-id>                    leave a room
-  history <room-id> [--limit N] [--before RFC3339]
+  read <room-id>                     mark a room as read
+  dm <username>                      open a direct message
+  edit-room <room-id> [--name N] [--desc D] [--private true|false]
+  delete-room <room-id> --yes        delete a room (owner)
+
+Membership (owner/admin):
+  members <room-id>                  list members
+  kick <room-id> <username>          remove a member
+  promote|demote <room-id> <username>  make/unmake an admin (owner)
+  invite <room-id> [--uses N] [--ttl-hours H]   create an invite code
+  invites <room-id>                  list invites
+  revoke-invite <room-id> <invite-id>
+  redeem <invite-code>               join a room with an invite code
+
+Messages:
+  history <room-id> [--limit N] [--before RFC3339] [--ids]
                                      print room history, oldest first
-  send <room-id> <message...> [--type text|diff|code|log|commit]
-                                     post a message
+  send <room-id> <message...> [--type text|diff|code|log|commit] [--reply ID]
+  send <room-id> --file PATH|- [--type diff]
+                                     send a message from a file or stdin
+  edit <room-id> <message-id> <new text...>
+  delete <room-id> <message-id>
+  search <query...> [--room ID] [--limit N]
   chat <room-id>                     live view: realtime messages, presence, typing
+
   version                            print the build version
 
 Global flags:
@@ -89,6 +117,9 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 		baseURL = *server
 	}
 	client := NewClient(baseURL, sessionToken(sess, *tokenOverride))
+	if sess != nil {
+		client.Username = sess.User.Username
+	}
 	// Wire silent renewal: when the access token nears expiry, the client
 	// rotates it with the stored refresh token and persists the new pair.
 	if sess != nil && *tokenOverride == "" {
@@ -102,23 +133,63 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 
 	switch cmd {
 	case "register":
-		return cmdRegister(ctx, out, client, cmdArgs)
+		return cmdRegister(ctx, out, in, client, cmdArgs)
 	case "login":
-		return cmdLogin(ctx, out, client, baseURL, cmdArgs)
+		return cmdLogin(ctx, out, in, client, baseURL, cmdArgs)
 	case "logout":
 		return cmdLogout(ctx, out, client)
+	case "whoami":
+		return cmdWhoami(ctx, out, client)
+	case "passwd":
+		return cmdPasswd(ctx, out, in, client, cmdArgs)
+	case "sessions":
+		return cmdSessions(ctx, out, client, cmdArgs)
+	case "delete-account":
+		return cmdDeleteAccount(ctx, out, in, client, cmdArgs)
 	case "rooms":
-		return cmdRooms(ctx, out, client)
+		return cmdRooms(ctx, out, client, cmdArgs)
+	case "unread":
+		return cmdUnread(ctx, out, client)
 	case "create":
 		return cmdCreateRoom(ctx, out, client, cmdArgs)
 	case "join":
 		return cmdJoin(ctx, out, client, cmdArgs)
 	case "leave":
 		return cmdLeave(ctx, out, client, cmdArgs)
+	case "read":
+		return cmdRead(ctx, out, client, cmdArgs)
+	case "dm":
+		return cmdDM(ctx, out, client, cmdArgs)
+	case "edit-room":
+		return cmdEditRoom(ctx, out, client, cmdArgs)
+	case "delete-room":
+		return cmdDeleteRoom(ctx, out, client, cmdArgs)
+	case "members":
+		return cmdMembers(ctx, out, client, cmdArgs)
+	case "kick":
+		return cmdKick(ctx, out, client, cmdArgs)
+	case "promote":
+		return cmdRole(ctx, out, client, "admin", cmdArgs)
+	case "demote":
+		return cmdRole(ctx, out, client, "member", cmdArgs)
+	case "invite":
+		return cmdInvite(ctx, out, client, cmdArgs)
+	case "invites":
+		return cmdInvites(ctx, out, client, cmdArgs)
+	case "revoke-invite":
+		return cmdRevokeInvite(ctx, out, client, cmdArgs)
+	case "redeem":
+		return cmdRedeem(ctx, out, client, cmdArgs)
 	case "history":
 		return cmdHistory(ctx, out, client, cmdArgs)
 	case "send":
-		return cmdSend(ctx, out, client, cmdArgs)
+		return cmdSend(ctx, out, in, client, cmdArgs)
+	case "edit":
+		return cmdEditMessage(ctx, out, client, cmdArgs)
+	case "delete":
+		return cmdDeleteMessage(ctx, out, client, cmdArgs)
+	case "search":
+		return cmdSearch(ctx, out, client, cmdArgs)
 	case "chat":
 		return cmdChat(ctx, out, in, client, cmdArgs)
 	case "help", "--help", "-h":
@@ -161,11 +232,15 @@ func requireArgs(cmdArgs []string, n int, form string) error {
 	return nil
 }
 
-func cmdRegister(ctx context.Context, out io.Writer, c *Client, args []string) error {
-	if err := requireArgs(args, 2, "register <username> <password>"); err != nil {
+func cmdRegister(ctx context.Context, out io.Writer, in io.Reader, c *Client, args []string) error {
+	if len(args) < 1 || len(args) > 2 {
+		return errors.New("usage: vili register <username> [password]")
+	}
+	pw, err := secretArg(in, args, 1, "password")
+	if err != nil {
 		return err
 	}
-	u, err := c.Register(ctx, args[0], args[1])
+	u, err := c.Register(ctx, args[0], pw)
 	if err != nil {
 		return err
 	}
@@ -173,11 +248,15 @@ func cmdRegister(ctx context.Context, out io.Writer, c *Client, args []string) e
 	return nil
 }
 
-func cmdLogin(ctx context.Context, out io.Writer, c *Client, baseURL string, args []string) error {
-	if err := requireArgs(args, 2, "login <username> <password>"); err != nil {
+func cmdLogin(ctx context.Context, out io.Writer, in io.Reader, c *Client, baseURL string, args []string) error {
+	if len(args) < 1 || len(args) > 2 {
+		return errors.New("usage: vili login <username> [password]")
+	}
+	pw, err := secretArg(in, args, 1, "password")
+	if err != nil {
 		return err
 	}
-	resp, err := c.Login(ctx, args[0], args[1])
+	resp, err := c.Login(ctx, args[0], pw)
 	if err != nil {
 		return err
 	}
@@ -206,41 +285,6 @@ func cmdLogout(ctx context.Context, out io.Writer, c *Client) error {
 	return nil
 }
 
-func cmdRooms(ctx context.Context, out io.Writer, c *Client) error {
-	rooms, err := c.ListRooms(ctx)
-	if err != nil {
-		return err
-	}
-	if len(rooms) == 0 {
-		fmt.Fprintln(out, "no rooms yet — create one with: vili create <name>")
-		return nil
-	}
-	for _, r := range rooms {
-		desc := ""
-		if r.Description != "" {
-			desc = "  — " + r.Description
-		}
-		fmt.Fprintf(out, "%s  %s%s\n", r.ID, r.Name, desc)
-	}
-	return nil
-}
-
-func cmdCreateRoom(ctx context.Context, out io.Writer, c *Client, args []string) error {
-	if len(args) < 1 || len(args) > 2 {
-		return errors.New("usage: vili create <name> [description]")
-	}
-	desc := ""
-	if len(args) == 2 {
-		desc = args[1]
-	}
-	r, err := c.CreateRoom(ctx, args[0], desc)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "created %s (id %s)\n", r.Name, r.ID)
-	return nil
-}
-
 func cmdJoin(ctx context.Context, out io.Writer, c *Client, args []string) error {
 	if err := requireArgs(args, 1, "join <room-id>"); err != nil {
 		return err
@@ -264,15 +308,15 @@ func cmdLeave(ctx context.Context, out io.Writer, c *Client, args []string) erro
 }
 
 func cmdHistory(ctx context.Context, out io.Writer, c *Client, args []string) error {
-	fs := flag.NewFlagSet("history", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
+	fs := newFlagSet("history")
 	limit := fs.Int("limit", 0, "max messages (default server limit)")
 	before := fs.String("before", "", "only messages older than this RFC3339 time")
-	if err := fs.Parse(args); err != nil {
+	ids := fs.Bool("ids", false, "show message ids (for reply/edit/delete)")
+	pos, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	pos := fs.Args()
-	if err := requireArgs(pos, 1, "history <room-id> [--limit N] [--before RFC3339]"); err != nil {
+	if err := requireArgs(pos, 1, "history <room-id> [--limit N] [--before RFC3339] [--ids]"); err != nil {
 		return err
 	}
 	var beforePtr *time.Time
@@ -287,39 +331,69 @@ func cmdHistory(ctx context.Context, out io.Writer, c *Client, args []string) er
 	if err != nil {
 		return err
 	}
-	printMessages(out, messages)
+	printMessagesOpts(out, messages, printOpts{IDs: *ids, Me: c.Username})
 	return nil
 }
 
-func cmdSend(ctx context.Context, out io.Writer, c *Client, args []string) error {
-	fs := flag.NewFlagSet("send", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	typ := fs.String("type", "", "message type: text|diff|code|log|commit")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	pos := fs.Args()
-	if len(pos) < 2 {
-		return errors.New("usage: vili send <room-id> <message...> [--type ...]")
-	}
-	m, err := c.SendMessage(ctx, pos[0], strings.Join(pos[1:], " "), *typ)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "sent (id %s)\n", m.ID)
-	return nil
+// printOpts tunes message rendering.
+type printOpts struct {
+	// IDs prefixes each message with its full id (needed to reply/edit/delete).
+	IDs bool
+	// Me is the signed-in username; messages that @mention it are flagged.
+	Me string
 }
 
 // printMessages writes messages oldest-first in a chat-like form,
 // sanitizing ANSI escape codes and control characters to prevent terminal injection.
 func printMessages(out io.Writer, messages []Message) {
+	printMessagesOpts(out, messages, printOpts{})
+}
+
+func printMessagesOpts(out io.Writer, messages []Message, o printOpts) {
 	for _, m := range messages {
-		fmt.Fprintf(out, "%s  %s: %s\n",
-			m.CreatedAt.Local().Format("15:04:05"),
-			sanitizeTerminal(m.Username),
-			sanitizeTerminal(m.Content),
-		)
+		fmt.Fprintln(out, formatMessage(m, o))
 	}
+}
+
+// formatMessage renders one message. Untrusted fields are sanitized. Deleted
+// messages show a tombstone, edited ones are marked, replies show the short id
+// of their target, and messages that @mention the signed-in user are flagged
+// with a leading "»".
+func formatMessage(m Message, o printOpts) string {
+	var b strings.Builder
+	if o.Me != "" && !m.Deleted {
+		for _, name := range m.Mentions {
+			if name == o.Me {
+				b.WriteString("» ")
+				break
+			}
+		}
+	}
+	if o.IDs {
+		b.WriteString(m.ID + "  ")
+	}
+	fmt.Fprintf(&b, "%s  %s", m.CreatedAt.Local().Format("15:04:05"), sanitizeTerminal(m.Username))
+	if m.ReplyTo != "" {
+		fmt.Fprintf(&b, " (↪ %s)", shortID(m.ReplyTo))
+	}
+	b.WriteString(": ")
+	if m.Deleted {
+		b.WriteString("[message deleted]")
+		return b.String()
+	}
+	b.WriteString(sanitizeTerminal(m.Content))
+	if m.EditedAt != nil {
+		b.WriteString(" (edited)")
+	}
+	return b.String()
+}
+
+// shortID abbreviates a UUID for display.
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // sanitizeTerminal strips ANSI escape sequences and non-printable control characters

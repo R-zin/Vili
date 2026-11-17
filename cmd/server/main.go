@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/R-zin/vili/internal/api"
 	"github.com/R-zin/vili/internal/auth"
@@ -54,6 +55,12 @@ func run() error {
 	}
 	slog.Info("migrations applied", "count", len(applied), "versions", applied)
 
+	// Background cleanup of expired refresh tokens and invites; stops when run
+	// returns.
+	janitorCtx, stopJanitor := context.WithCancel(context.Background())
+	defer stopJanitor()
+	go store.RunJanitor(janitorCtx, db, time.Hour)
+
 	tokens, err := auth.NewTokenService(cfg.JWTSecret, cfg.JWTExpiry)
 	if err != nil {
 		return err
@@ -69,11 +76,11 @@ func run() error {
 
 	// Wire each feature package's handler onto a single router, behind the
 	// Phase-5 middleware bundle (hardening, observability, rate limiting).
-	mw, stop := buildMiddleware(cfg)
+	mw, stop := buildMiddleware(cfg, hub)
 	defer stop()
 	handler := api.NewRouter(
 		user.NewHandler(userRepo, tokens, userRepo, cfg.RefreshTokenTTL),
-		room.NewHandler(room.NewPostgresRepository(db)),
+		room.NewHandler(room.NewPostgresRepository(db), hub),
 		message.NewHandler(messageRepo, hub),
 		ws.NewHandler(hub, messageRepo, userRepo, cfg.Security.CORSAllowedOrigins...),
 		tokens,
@@ -93,7 +100,7 @@ func run() error {
 // the rate limiters' background sweepers. Everything is gated by config so a
 // zero-value-friendly composition (tests) still works: each knob can be turned
 // off without recompiling.
-func buildMiddleware(cfg config.Config) (api.Middleware, func()) {
+func buildMiddleware(cfg config.Config, hub *ws.Hub) (api.Middleware, func()) {
 	var mw api.Middleware
 	var closers []func()
 
@@ -103,6 +110,14 @@ func buildMiddleware(cfg config.Config) (api.Middleware, func()) {
 	if cfg.Observability.MetricsEnabled {
 		reg = metrics.New()
 		mw.Metrics = reg.Handler()
+		reg.GaugeFunc("vili_ws_connections", "Live websocket connections.", func() float64 {
+			c, _ := hub.Stats()
+			return float64(c)
+		})
+		reg.GaugeFunc("vili_ws_active_rooms", "Rooms with at least one live websocket connection.", func() float64 {
+			_, r := hub.Stats()
+			return float64(r)
+		})
 	}
 
 	// Rate limiting: per-IP on auth, per-user on message POSTs.
@@ -110,7 +125,11 @@ func buildMiddleware(cfg config.Config) (api.Middleware, func()) {
 		authLim := ratelimit.New(cfg.RateLimit.AuthRPS, cfg.RateLimit.AuthBurst)
 		msgLim := ratelimit.New(cfg.RateLimit.MessagesRPS, cfg.RateLimit.MessagesBurst)
 		closers = append(closers, authLim.Stop, msgLim.Stop)
-		mw.AuthLimit = httputil.RateLimit(authLim, httputil.KeyByIP)
+		trusted, err := httputil.ParseTrustedProxies(cfg.Security.TrustedProxies)
+		if err != nil {
+			slog.Error("invalid TRUSTED_PROXIES", "error", err) // unreachable: config validates
+		}
+		mw.AuthLimit = httputil.RateLimit(authLim, httputil.NewKeyByIP(trusted))
 		mw.MessageLimit = httputil.RateLimitFunc(msgLim, httputil.KeyByUser)
 	}
 

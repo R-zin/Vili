@@ -38,8 +38,18 @@ func cmdChat(parent context.Context, out io.Writer, in io.Reader, c *Client, arg
 	if err != nil {
 		return err
 	}
-	printMessages(out, messages)
+	printMessagesOpts(out, messages, printOpts{Me: c.Username})
 	cursor := cursorFrom(messages)
+
+	// Everything shown is now read; mark it so unread counters stay accurate,
+	// and again on exit to cover what arrived while the view was open. Best
+	// effort: a failure here must never break chatting.
+	_ = c.MarkRead(ctx, roomID)
+	defer func() {
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(parent), 3*time.Second)
+		defer rcancel()
+		_ = c.MarkRead(rctx, roomID)
+	}()
 
 	// Try realtime first: open the websocket and, on success, run the live loop.
 	conn, err := c.watch(ctx, roomID)

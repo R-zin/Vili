@@ -33,6 +33,22 @@ func (stubMessageRepo) IsMember(ctx context.Context, roomID, userID uuid.UUID) (
 	return true, nil
 }
 
+func (stubMessageRepo) MemberRole(ctx context.Context, roomID, userID uuid.UUID) (string, error) {
+	return "member", nil
+}
+func (stubMessageRepo) ByID(ctx context.Context, id uuid.UUID) (message.Message, error) {
+	return message.Message{}, message.ErrMessageNotFound
+}
+func (stubMessageRepo) Edit(ctx context.Context, id uuid.UUID, content string, c []string) (message.Message, error) {
+	return message.Message{}, message.ErrMessageNotFound
+}
+func (stubMessageRepo) Delete(ctx context.Context, id uuid.UUID) error {
+	return message.ErrMessageNotFound
+}
+func (stubMessageRepo) Search(ctx context.Context, u uuid.UUID, q string, r *uuid.UUID, limit int) ([]message.Message, error) {
+	return nil, nil
+}
+
 // messageNilHandler returns a message handler backed by the stub repo.
 func messageNilHandler() *message.Handler { return message.NewHandler(stubMessageRepo{}, nil) }
 

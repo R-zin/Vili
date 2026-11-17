@@ -18,11 +18,13 @@ import (
 // members connect and disconnect; typing is relayed ephemerally (never
 // persisted) while a member composes.
 const (
-	MessageNew    = "message.new"
-	Typing        = "typing"
-	PresenceState = "presence.state"
-	PresenceJoin  = "presence.join"
-	PresenceLeave = "presence.leave"
+	MessageNew     = "message.new"
+	MessageEdited  = "message.edited"
+	MessageDeleted = "message.deleted"
+	Typing         = "typing"
+	PresenceState  = "presence.state"
+	PresenceJoin   = "presence.join"
+	PresenceLeave  = "presence.leave"
 )
 
 // Event is the JSON envelope exchanged over the websocket. Payload is
@@ -59,6 +61,24 @@ func NewMessage(roomID uuid.UUID, v any) (Event, error) {
 		return Event{}, err
 	}
 	return Event{Type: MessageNew, RoomID: roomID, Payload: p}, nil
+}
+
+// NewMessageEdited builds a message.edited event whose payload is the updated
+// message (same shape as message.new).
+func NewMessageEdited(roomID uuid.UUID, v any) (Event, error) {
+	p, err := json.Marshal(v)
+	if err != nil {
+		return Event{}, err
+	}
+	return Event{Type: MessageEdited, RoomID: roomID, Payload: p}, nil
+}
+
+// NewMessageDeleted builds a message.deleted event carrying the message id.
+func NewMessageDeleted(roomID, messageID uuid.UUID) Event {
+	p, _ := json.Marshal(struct {
+		ID uuid.UUID `json:"id"`
+	}{messageID})
+	return Event{Type: MessageDeleted, RoomID: roomID, Payload: p}
 }
 
 // NewPresenceState builds a presence.state event carrying the online usernames.

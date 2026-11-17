@@ -228,3 +228,28 @@ func TestJoinReturnValueOnClose(t *testing.T) {
 		t.Error("Join on a closed hub must report refusal")
 	}
 }
+
+func TestHubStatsAndDisconnect(t *testing.T) {
+	h := NewHub()
+	roomA, roomB := uuid.New(), uuid.New()
+	u1, u2 := uuid.New(), uuid.New()
+	c1 := &Client{userID: u1, username: "a", send: make(chan event.Event, 4), done: make(chan struct{})}
+	c2 := &Client{userID: u2, username: "b", send: make(chan event.Event, 4), done: make(chan struct{})}
+	c3 := &Client{userID: u1, username: "a", send: make(chan event.Event, 4), done: make(chan struct{})}
+	h.Join(roomA, c1)
+	h.Join(roomA, c2)
+	h.Join(roomB, c3)
+	if conns, rooms := h.Stats(); conns != 3 || rooms != 2 {
+		t.Fatalf("stats = %d, %d", conns, rooms)
+	}
+	// Disconnect drops only that user's sockets in that room.
+	h.Disconnect(roomA, u1)
+	if !c1.isDone() || c2.isDone() || c3.isDone() {
+		t.Fatalf("disconnect scope wrong: c1=%v c2=%v c3=%v", c1.isDone(), c2.isDone(), c3.isDone())
+	}
+	h.Disconnect(uuid.New(), u1) // unknown room: no-op
+	h.CloseRoom(roomA)
+	if !c2.isDone() || c3.isDone() {
+		t.Fatalf("CloseRoom scope wrong")
+	}
+}

@@ -16,7 +16,7 @@ func clearEnv(t *testing.T) {
 		"MAX_BODY_BYTES", "SECURITY_HEADERS_ENABLED", "CORS_ALLOWED_ORIGINS",
 		"RATE_LIMIT_ENABLED", "RATE_LIMIT_AUTH_RPS", "RATE_LIMIT_AUTH_BURST",
 		"RATE_LIMIT_MESSAGES_RPS", "RATE_LIMIT_MESSAGES_BURST",
-		"WS_MAX_CONNS_PER_USER",
+		"WS_MAX_CONNS_PER_USER", "TRUSTED_PROXIES",
 		"REQUEST_LOG_ENABLED", "METRICS_ENABLED", "PPROF_ENABLED",
 	} {
 		t.Setenv(k, "")
@@ -238,5 +238,27 @@ func TestLoad_RateLimitDisabledSkipsValidation(t *testing.T) {
 	}
 	if cfg.RateLimit.Enabled {
 		t.Error("expected rate limiting disabled")
+	}
+}
+
+func TestLoad_TrustedProxies(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("JWT_SECRET", "0123456789abcdef0123456789abcdef")
+
+	cfg, err := Load()
+	if err != nil || len(cfg.Security.TrustedProxies) != 0 {
+		t.Fatalf("default must trust no proxy: %v %v", err, cfg.Security.TrustedProxies)
+	}
+
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 192.0.2.1 ,fd00::/8")
+	cfg, err = Load()
+	if err != nil || len(cfg.Security.TrustedProxies) != 3 || cfg.Security.TrustedProxies[1] != "192.0.2.1" {
+		t.Fatalf("parse: %v %v", err, cfg.Security.TrustedProxies)
+	}
+
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8,not-an-ip")
+	if _, err := Load(); err == nil {
+		t.Fatal("invalid entry must fail startup")
 	}
 }

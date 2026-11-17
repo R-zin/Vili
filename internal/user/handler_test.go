@@ -68,6 +68,27 @@ func (f *fakeRepo) ByID(ctx context.Context, id uuid.UUID) (User, error) {
 	return User{}, ErrNotFound
 }
 
+func (f *fakeRepo) UpdatePassword(ctx context.Context, id uuid.UUID, hash string) error {
+	for name, u := range f.byUsername {
+		if u.ID == id {
+			u.PasswordHash = hash
+			f.byUsername[name] = u
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+
+func (f *fakeRepo) Delete(ctx context.Context, id uuid.UUID) error {
+	for name, u := range f.byUsername {
+		if u.ID == id {
+			delete(f.byUsername, name)
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+
 // fakeRefreshStore is an in-memory auth.RefreshStore for tests. Tokens are
 // keyed by their (fake) hash; the store records revocations for assertions.
 type fakeRefreshStore struct {
@@ -134,6 +155,38 @@ func (s *fakeRefreshStore) RevokeRefreshToken(ctx context.Context, hash string) 
 
 // seed inserts a refresh token directly and returns the raw token + its hash,
 // so tests can present the raw token to the refresh/logout endpoints.
+func (s *fakeRefreshStore) ListSessions(ctx context.Context, userID uuid.UUID) ([]auth.Session, error) {
+	out := []auth.Session{}
+	seen := map[uuid.UUID]bool{}
+	for _, t := range s.byHash {
+		if t.UserID == userID && !t.Consumed && !seen[t.FamilyID] {
+			seen[t.FamilyID] = true
+			out = append(out, auth.Session{ID: t.FamilyID, ExpiresAt: t.ExpiresAt})
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeRefreshStore) RevokeSession(ctx context.Context, userID, familyID uuid.UUID) (bool, error) {
+	found := false
+	for h, t := range s.byHash {
+		if t.UserID == userID && t.FamilyID == familyID {
+			delete(s.byHash, h)
+			found = true
+		}
+	}
+	return found, nil
+}
+
+func (s *fakeRefreshStore) RevokeAllSessions(ctx context.Context, userID uuid.UUID) error {
+	for h, t := range s.byHash {
+		if t.UserID == userID {
+			delete(s.byHash, h)
+		}
+	}
+	return nil
+}
+
 func (s *fakeRefreshStore) seed(t *testing.T, userID, familyID uuid.UUID, consumed bool, ttl time.Duration) (raw, hash string, id uuid.UUID) {
 	t.Helper()
 	raw, hash, err := auth.GenerateRefresh()

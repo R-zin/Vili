@@ -106,7 +106,7 @@ func runRealtimeChat(ctx context.Context, out io.Writer, c *Client, roomID strin
 			if !ok {
 				return errors.New("realtime connection closed")
 			}
-			renderEvent(out, e)
+			renderEvent(out, e, c.Username)
 		}
 	}
 }
@@ -114,12 +114,24 @@ func runRealtimeChat(ctx context.Context, out io.Writer, c *Client, roomID strin
 // renderEvent writes one realtime event in chat form. The sender's own
 // message echo is indistinguishable from others' messages, so it renders the
 // same — the source of truth is the server.
-func renderEvent(out io.Writer, e wsEvent) {
+func renderEvent(out io.Writer, e wsEvent, me string) {
 	switch e.Type {
 	case eventMessageNew:
 		var m Message
 		if err := json.Unmarshal(e.Payload, &m); err == nil {
-			printMessages(out, []Message{m})
+			printMessagesOpts(out, []Message{m}, printOpts{Me: me})
+		}
+	case eventMessageEdited:
+		var m Message
+		if err := json.Unmarshal(e.Payload, &m); err == nil {
+			fmt.Fprintf(out, "  · edited: %s\n", formatMessage(m, printOpts{Me: me}))
+		}
+	case eventMessageDeleted:
+		var p struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err == nil && p.ID != "" {
+			fmt.Fprintf(out, "  · message %s was deleted\n", shortID(p.ID))
 		}
 	case eventTyping:
 		var p typingPayload

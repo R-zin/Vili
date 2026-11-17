@@ -238,11 +238,11 @@ func TestKeyByIP(t *testing.T) {
 		t.Errorf("X-Forwarded-For must not change the key, got %q", k2)
 	}
 
-	// Fly-Client-IP is honored when present.
+	// Fly-Client-IP from an untrusted peer is attacker-controlled: ignored.
 	r.Header.Set("Fly-Client-IP", "198.51.100.42")
 	k3, _ := KeyByIP(r)
-	if k3 != "ip:198.51.100.42" {
-		t.Errorf("Fly-Client-IP expected, got %q", k3)
+	if k3 != "ip:203.0.113.7" {
+		t.Errorf("untrusted Fly-Client-IP must be ignored, got %q", k3)
 	}
 
 	// IPv6 address is masked to /64 CIDR.
@@ -271,5 +271,60 @@ func TestStatusWriterCapturesBytes(t *testing.T) {
 	// Unwrap must expose the recorder for http.ResponseController.
 	if sw.Unwrap() != rec {
 		t.Error("Unwrap should return the wrapped writer")
+	}
+}
+
+func TestClientIP_TrustedProxies(t *testing.T) {
+	trusted, err := ParseTrustedProxies([]string{"10.0.0.0/8", "192.0.2.1", "fd00::/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := func(remote string, hdr map[string][]string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = remote
+		for k, vs := range hdr {
+			for _, v := range vs {
+				r.Header.Add(k, v)
+			}
+		}
+		return r
+	}
+	cases := []struct {
+		name string
+		r    *http.Request
+		want string
+	}{
+		{"untrusted peer ignores XFF", req("203.0.113.9:1", map[string][]string{"X-Forwarded-For": {"1.1.1.1"}}), "203.0.113.9"},
+		{"untrusted peer ignores Fly header", req("203.0.113.9:1", map[string][]string{"Fly-Client-IP": {"1.1.1.1"}}), "203.0.113.9"},
+		{"trusted peer, Fly header", req("10.1.2.3:1", map[string][]string{"Fly-Client-IP": {"198.51.100.4"}}), "198.51.100.4"},
+		{"trusted peer, XFF single", req("10.1.2.3:1", map[string][]string{"X-Forwarded-For": {"198.51.100.5"}}), "198.51.100.5"},
+		{"spoofed XFF prefix is skipped (right-most untrusted wins)", req("10.1.2.3:1", map[string][]string{"X-Forwarded-For": {"6.6.6.6, 198.51.100.6, 10.9.9.9"}}), "198.51.100.6"},
+		{"multiple XFF headers", req("10.1.2.3:1", map[string][]string{"X-Forwarded-For": {"6.6.6.6", "198.51.100.7"}}), "198.51.100.7"},
+		{"malformed XFF falls back to peer", req("10.1.2.3:1", map[string][]string{"X-Forwarded-For": {"not-an-ip"}}), "10.1.2.3"},
+		{"all-trusted chain falls back to peer", req("10.1.2.3:1", map[string][]string{"X-Forwarded-For": {"10.4.4.4"}}), "10.1.2.3"},
+		{"bare-IP trusted entry", req("192.0.2.1:1", map[string][]string{"X-Forwarded-For": {"198.51.100.8"}}), "198.51.100.8"},
+		{"trusted v6 peer", req("[fd00::1]:1", map[string][]string{"X-Forwarded-For": {"198.51.100.9"}}), "198.51.100.9"},
+		{"no port in RemoteAddr", req("203.0.113.9", nil), "203.0.113.9"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClientIP(tc.r, trusted); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+	if k, ok := NewKeyByIP(trusted)(req("10.1.2.3:1", map[string][]string{"Fly-Client-IP": {"198.51.100.4"}})); !ok || k != "ip:198.51.100.4" {
+		t.Fatalf("key = %q", k)
+	}
+}
+
+func TestParseTrustedProxies_Errors(t *testing.T) {
+	for _, bad := range []string{"nope", "10.0.0.0/99", "1.2.3"} {
+		if _, err := ParseTrustedProxies([]string{bad}); err == nil {
+			t.Errorf("%q should be rejected", bad)
+		}
+	}
+	if n, err := ParseTrustedProxies([]string{"", " "}); err != nil || len(n) != 0 {
+		t.Errorf("blank entries should be ignored: %v %v", n, err)
 	}
 }

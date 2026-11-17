@@ -1,9 +1,11 @@
 package httputil
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/R-zin/vili/internal/auth"
 	"github.com/R-zin/vili/internal/ratelimit"
@@ -16,34 +18,101 @@ import (
 // must never lock out traffic on an internal edge).
 type KeyFunc func(r *http.Request) (string, bool)
 
-// KeyByIP keys buckets by the client IP. It checks Fly-Client-IP (when deployed
-// on Fly.io) and falls back to RemoteAddr. IPv6 addresses are masked to /64 CIDR
-// to prevent IPv6 subnet rotation attacks.
-func KeyByIP(r *http.Request) (string, bool) {
-	var host string
-	if flyIP := r.Header.Get("Fly-Client-IP"); flyIP != "" {
-		host = flyIP
-	} else {
-		var err error
-		host, _, err = net.SplitHostPort(r.RemoteAddr)
+// ParseTrustedProxies parses a list of CIDRs or bare IPs (a bare IP becomes a
+// /32 or /128) into networks. An empty list yields none, meaning no proxy is
+// trusted and forwarded headers are never honored.
+func ParseTrustedProxies(entries []string) ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(entries))
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if !strings.Contains(e, "/") {
+			ip := net.ParseIP(e)
+			if ip == nil {
+				return nil, fmt.Errorf("httputil: trusted proxy %q is not an IP or CIDR", e)
+			}
+			if ip.To4() != nil {
+				e += "/32"
+			} else {
+				e += "/128"
+			}
+		}
+		_, n, err := net.ParseCIDR(e)
 		if err != nil {
-			host = r.RemoteAddr
+			return nil, fmt.Errorf("httputil: trusted proxy %q: %w", e, err)
 		}
+		nets = append(nets, n)
 	}
-	if host == "" {
-		return "", false
-	}
-	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip.To4() != nil {
-			return "ip:" + ip.String(), true
-		}
-		// IPv6: mask to /64 to prevent subnet rotation DoS
-		mask := net.CIDRMask(64, 128)
-		return "ip:" + ip.Mask(mask).String(), true
-	}
-	return "ip:" + host, true
+	return nets, nil
 }
+
+func inNets(ip net.IP, nets []*net.IPNet) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClientIP returns the originating client address of r. The TCP peer is
+// authoritative unless it belongs to a trusted proxy network, in which case the
+// proxy's Fly-Client-IP header, or else the right-most X-Forwarded-For entry
+// that is not itself a trusted proxy, is used. Forwarded headers from any
+// other peer are attacker-controlled and ignored, so a client cannot dodge a
+// rate limit by inventing an address. It returns "" when no address can be
+// determined.
+func ClientIP(r *http.Request, trusted []*net.IPNet) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+	if peer == nil {
+		return host
+	}
+	if len(trusted) == 0 || !inNets(peer, trusted) {
+		return peer.String()
+	}
+	if fly := net.ParseIP(strings.TrimSpace(r.Header.Get("Fly-Client-IP"))); fly != nil {
+		return fly.String()
+	}
+	xff := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(xff) - 1; i >= 0; i-- {
+		ip := net.ParseIP(strings.TrimSpace(xff[i]))
+		if ip == nil {
+			break // malformed entry: stop trusting the chain
+		}
+		if !inNets(ip, trusted) {
+			return ip.String()
+		}
+	}
+	return peer.String()
+}
+
+// NewKeyByIP returns a KeyFunc that buckets by client IP (see ClientIP).
+// IPv6 addresses are masked to /64 so rotating within a subnet doesn't evade
+// the limit.
+func NewKeyByIP(trusted []*net.IPNet) KeyFunc {
+	return func(r *http.Request) (string, bool) {
+		host := ClientIP(r, trusted)
+		if host == "" {
+			return "", false
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			if ip.To4() != nil {
+				return "ip:" + ip.String(), true
+			}
+			return "ip:" + ip.Mask(net.CIDRMask(64, 128)).String(), true
+		}
+		return "ip:" + host, true
+	}
+}
+
+// KeyByIP keys buckets by the TCP peer address, trusting no proxy headers.
+var KeyByIP KeyFunc = NewKeyByIP(nil)
 
 // KeyByUser keys buckets by the authenticated user id from the request
 // context. Requests without an authenticated user are not limited (they are

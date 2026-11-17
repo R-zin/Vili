@@ -52,4 +52,8 @@ type Repository interface {
 	// UsernameByID returns only the username for an id, returning ErrNotFound
 	// when absent. It backs realtime presence, which authenticates by id.
 	UsernameByID(ctx context.Context, id uuid.UUID) (string, error)
+	// UpdatePassword replaces the stored password hash (ErrNotFound if absent).
+	UpdatePassword(ctx context.Context, id uuid.UUID, passwordHash string) error
+	// Delete removes the account and, via cascades, everything it owns.
+	Delete(ctx context.Context, id uuid.UUID) error
 }
