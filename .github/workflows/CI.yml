@@ -151,14 +151,18 @@ jobs:
           ./bin/vili --server http://localhost:8080 register bob anothersecret
           ./bin/vili --server http://localhost:8080 login bob anothersecret
           # Non-member access is rejected
-          for op in history send; do
-            if ./bin/vili --server http://localhost:8080 $op "$ROOM_ID" probe 2>&1 | grep -qi "not found"; then
-              echo "non-member $op correctly denied (404)"
-            else
-              echo "FAIL: non-member $op was not denied" >&2
-              exit 1
-            fi
-          done
+          if ./bin/vili --server http://localhost:8080 history "$ROOM_ID" 2>&1 | grep -qi "not found"; then
+            echo "non-member history correctly denied (404)"
+          else
+            echo "FAIL: non-member history was not denied" >&2
+            exit 1
+          fi
+          if ./bin/vili --server http://localhost:8080 send "$ROOM_ID" probe 2>&1 | grep -qi "not found"; then
+            echo "non-member send correctly denied (404)"
+          else
+            echo "FAIL: non-member send was not denied" >&2
+            exit 1
+          fi
           # Bob joins the room
           ./bin/vili --server http://localhost:8080 join "$ROOM_ID"
           ./bin/vili --server http://localhost:8080 send "$ROOM_ID" "bob was here"
