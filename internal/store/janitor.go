@@ -17,7 +17,8 @@ const (
 )
 
 // Purge deletes expired refresh tokens and expired invites past their grace
-// periods, returning how many rows of each were removed.
+// periods (returning how many of each were removed), stale cluster instances
+// and old bus outbox rows.
 func Purge(ctx context.Context, db *sql.DB) (tokens, invites int64, err error) {
 	res, err := db.ExecContext(ctx,
 		`DELETE FROM refresh_tokens WHERE expires_at < now() - $1::interval`, fmt.Sprintf("%d seconds", int(refreshTokenGrace.Seconds())))
@@ -32,6 +33,17 @@ func Purge(ctx context.Context, db *sql.DB) (tokens, invites int64, err error) {
 		return tokens, 0, fmt.Errorf("store: purge invites: %w", err)
 	}
 	invites, _ = res.RowsAffected()
+
+	// Cluster housekeeping: instances that stopped heartbeating long ago
+	// (crashed; their presence rows cascade) and delivered bus payloads.
+	if _, err := db.ExecContext(ctx,
+		`DELETE FROM ws_instances WHERE heartbeat_at < now() - interval '5 minutes'`); err != nil {
+		return tokens, invites, fmt.Errorf("store: purge stale instances: %w", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`DELETE FROM bus_outbox WHERE created_at < now() - interval '10 minutes'`); err != nil {
+		return tokens, invites, fmt.Errorf("store: purge bus outbox: %w", err)
+	}
 	return tokens, invites, nil
 }
 

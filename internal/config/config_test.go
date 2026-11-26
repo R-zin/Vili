@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,7 +17,7 @@ func clearEnv(t *testing.T) {
 		"MAX_BODY_BYTES", "SECURITY_HEADERS_ENABLED", "CORS_ALLOWED_ORIGINS",
 		"RATE_LIMIT_ENABLED", "RATE_LIMIT_AUTH_RPS", "RATE_LIMIT_AUTH_BURST",
 		"RATE_LIMIT_MESSAGES_RPS", "RATE_LIMIT_MESSAGES_BURST",
-		"WS_MAX_CONNS_PER_USER", "TRUSTED_PROXIES",
+		"WS_MAX_CONNS_PER_USER", "TRUSTED_PROXIES", "REALTIME_BUS", "INSTANCE_ID", "SESSION_CACHE_TTL",
 		"REQUEST_LOG_ENABLED", "METRICS_ENABLED", "PPROF_ENABLED",
 	} {
 		t.Setenv(k, "")
@@ -260,5 +261,34 @@ func TestLoad_TrustedProxies(t *testing.T) {
 	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8,not-an-ip")
 	if _, err := Load(); err == nil {
 		t.Fatal("invalid entry must fail startup")
+	}
+}
+
+func TestLoad_ClusterSettings(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("JWT_SECRET", "0123456789abcdef0123456789abcdef")
+	cfg, err := Load()
+	if err != nil || cfg.WS.Bus != "postgres" || cfg.WS.InstanceID != "" || cfg.WS.SessionCacheTTL != 30*time.Second {
+		t.Fatalf("defaults: %v %+v", err, cfg.WS)
+	}
+	t.Setenv("REALTIME_BUS", "Local")
+	t.Setenv("INSTANCE_ID", "web-2")
+	t.Setenv("SESSION_CACHE_TTL", "5s")
+	cfg, err = Load()
+	if err != nil || cfg.WS.Bus != "local" || cfg.WS.InstanceID != "web-2" || cfg.WS.SessionCacheTTL != 5*time.Second {
+		t.Fatalf("overrides: %v %+v", err, cfg.WS)
+	}
+	for k, bad := range map[string]string{"REALTIME_BUS": "redis", "SESSION_CACHE_TTL": "10m", "INSTANCE_ID": strings.Repeat("x", 129)} {
+		t.Run(k, func(t *testing.T) {
+			t.Setenv(k, bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=%q must be rejected", k, bad)
+			}
+		})
+	}
+	t.Setenv("SESSION_CACHE_TTL", "0s")
+	if _, err := Load(); err == nil {
+		t.Fatal("zero TTL must be rejected")
 	}
 }

@@ -17,6 +17,8 @@ type User struct {
 	Username     string    `json:"username"`
 	PasswordHash string    `json:"-"`
 	CreatedAt    time.Time `json:"created_at"`
+	// TokenVersion is embedded in access tokens; bumping it revokes them all.
+	TokenVersion int `json:"-"`
 }
 
 // Public is the safe, client-facing representation: it never includes the
@@ -56,4 +58,15 @@ type Repository interface {
 	UpdatePassword(ctx context.Context, id uuid.UUID, passwordHash string) error
 	// Delete removes the account and, via cascades, everything it owns.
 	Delete(ctx context.Context, id uuid.UUID) error
+	// BumpTokenVersion increments the user's token version, invalidating every
+	// access token minted before, and returns the new version.
+	BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, error)
+}
+
+// Revoker is told when sessions end so every instance can drop cached session
+// state and close the affected live connections at once. session is uuid.Nil
+// for "all of the user's sessions". It is satisfied by the realtime hub at the
+// wiring layer; nil disables it.
+type Revoker interface {
+	RevokeSession(userID, session uuid.UUID)
 }

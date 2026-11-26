@@ -30,6 +30,9 @@ type Client struct {
 	roomID   uuid.UUID
 	userID   uuid.UUID
 	username string
+	// session is the login session (refresh-token family) the socket was
+	// opened with, so revoking that session closes exactly its sockets.
+	session uuid.UUID
 
 	// send is the bounded outbound queue; the hub enqueues here.
 	send chan event.Event
@@ -41,12 +44,13 @@ type Client struct {
 }
 
 // newClient builds a Client for an accepted connection.
-func newClient(hub *Hub, conn *websocket.Conn, roomID, userID uuid.UUID, username string) *Client {
+func newClient(hub *Hub, conn *websocket.Conn, roomID, userID, session uuid.UUID, username string) *Client {
 	return &Client{
 		hub:      hub,
 		conn:     conn,
 		roomID:   roomID,
 		userID:   userID,
+		session:  session,
 		username: username,
 		send:     make(chan event.Event, sendBuffer),
 		done:     make(chan struct{}),
@@ -67,12 +71,17 @@ func (c *Client) run(ctx context.Context) {
 		c.close(websocket.StatusGoingAway, "connection refused")
 		return
 	}
-	// Send the freshly-joined client the current presence state, then tell the
-	// room someone arrived.
-	c.sendNow(event.NewPresenceState(c.roomID, c.hub.Presence(c.roomID)))
+	// Record the connection cluster-wide, send the freshly-joined client the
+	// current presence state, then tell the room someone arrived.
+	c.hub.trackPresence(ctx, c, +1)
+	c.sendNow(event.NewPresenceState(c.roomID, c.hub.Online(ctx, c.roomID)))
 	c.hub.Broadcast(c.roomID, event.NewPresenceJoin(c.roomID, c.username))
 	defer func() {
 		c.hub.Leave(c.roomID, c)
+		// The request context is done by now; presence cleanup must still run.
+		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), busTimeout)
+		defer cancel()
+		c.hub.trackPresence(pctx, c, -1)
 		c.hub.Broadcast(c.roomID, event.NewPresenceLeave(c.roomID, c.username))
 	}()
 

@@ -39,6 +39,8 @@ const (
 	defaultRateLimitMessagesBurst = 20
 
 	defaultWSMaxConnsPerUser = 5
+	defaultRealtimeBus       = "postgres"
+	defaultSessionCacheTTL   = 30 * time.Second
 
 	defaultSecurityHeadersEnabled = true
 	defaultCORSAllowedOrigins     = ""
@@ -99,8 +101,20 @@ type RateLimit struct {
 
 // WS holds the realtime hardening knobs.
 type WS struct {
-	// MaxConnsPerUser caps concurrent live websocket connections per user.
+	// MaxConnsPerUser caps concurrent live websocket connections per user (per
+	// instance).
 	MaxConnsPerUser int
+	// Bus selects how realtime events reach other instances: "postgres"
+	// (LISTEN/NOTIFY; required for more than one instance) or "local" (this
+	// process only).
+	Bus string
+	// InstanceID names this process in the cluster; empty means derive one
+	// from the hostname.
+	InstanceID string
+	// SessionCacheTTL bounds how long a token's session check is cached. Revocations
+	// invalidate the cache cluster-wide at once; the TTL is only the fallback
+	// if an instance misses that signal.
+	SessionCacheTTL time.Duration
 }
 
 // Observability holds the metrics, request-logging, and pprof knobs.
@@ -280,7 +294,32 @@ func (cfg *Config) loadWS() error {
 		return fmt.Errorf("config: WS_MAX_CONNS_PER_USER must be positive, got %d", n)
 	}
 	cfg.WS.MaxConnsPerUser = n
+
+	cfg.WS.Bus = strings.ToLower(strings.TrimSpace(stringEnv("REALTIME_BUS", defaultRealtimeBus)))
+	if cfg.WS.Bus != "postgres" && cfg.WS.Bus != "local" {
+		return fmt.Errorf("config: REALTIME_BUS must be postgres or local, got %q", cfg.WS.Bus)
+	}
+	cfg.WS.InstanceID = strings.TrimSpace(stringEnv("INSTANCE_ID", ""))
+	if len(cfg.WS.InstanceID) > 128 {
+		return fmt.Errorf("config: INSTANCE_ID must be at most 128 characters")
+	}
+	ttl, err := durationEnv("SESSION_CACHE_TTL", defaultSessionCacheTTL)
+	if err != nil {
+		return err
+	}
+	if ttl <= 0 || ttl > 5*time.Minute {
+		return fmt.Errorf("config: SESSION_CACHE_TTL must be between 1ns and 5m, got %s", ttl)
+	}
+	cfg.WS.SessionCacheTTL = ttl
 	return nil
+}
+
+// stringEnv reads a string variable, falling back to def when unset or empty.
+func stringEnv(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
 }
 
 // loadObservability populates the metrics, logging, and pprof knobs.

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -9,10 +10,24 @@ import (
 	"github.com/google/uuid"
 )
 
-// Claims are the registered JWT claims plus the subject user id. The user id
-// is carried in the standard "sub" claim.
+// Claims are the registered JWT claims plus the subject user id (standard
+// "sub" claim), the login session the token belongs to ("sid", the
+// refresh-token family) and the user's token version at mint time ("ver").
+// Revoking the session or bumping the version invalidates the token at once.
 type Claims struct {
 	jwt.RegisteredClaims
+	SessionID string `json:"sid,omitempty"`
+	Version   int    `json:"ver,omitempty"`
+}
+
+// Identity is what a verified access token says about its bearer.
+type Identity struct {
+	UserID uuid.UUID
+	// Session is the refresh-token family the token was minted for; uuid.Nil
+	// for tokens minted without one.
+	Session uuid.UUID
+	// Version is the user's token version when the token was minted.
+	Version int
 }
 
 // TokenService creates and verifies HS256 JWTs. The secret is injected at
@@ -21,7 +36,19 @@ type Claims struct {
 type TokenService struct {
 	secret []byte
 	expiry time.Duration
+	// validator, when set, is consulted on every authenticated request so
+	// revoked sessions are rejected before their tokens expire.
+	validator Validator
 }
+
+// Validator decides whether a cryptographically valid token's session is
+// still live (not logged out, not revoked, user still exists).
+type Validator interface {
+	Valid(ctx context.Context, id Identity) (bool, error)
+}
+
+// SetValidator installs v; call it during wiring, before serving.
+func (s *TokenService) SetValidator(v Validator) { s.validator = v }
 
 // MinJWTSecretBytes is the minimum key length enforced for HS256 signing (RFC 7518 § 3.2).
 const MinJWTSecretBytes = 32
@@ -47,15 +74,25 @@ func NewTokenService(secret []byte, expiry time.Duration) (*TokenService, error)
 // Expiry returns the configured access-token lifetime.
 func (s *TokenService) Expiry() time.Duration { return s.expiry }
 
-// Issue mints a signed token whose subject is the given user id.
+// Issue mints a signed token whose subject is the given user id, not bound to
+// a session, at token version 0.
 func (s *TokenService) Issue(userID uuid.UUID) (string, error) {
+	return s.IssueFor(Identity{UserID: userID})
+}
+
+// IssueFor mints a signed token for id (subject, session and version).
+func (s *TokenService) IssueFor(id Identity) (string, error) {
 	now := time.Now()
 	claims := Claims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   userID.String(),
+			Subject:   id.UserID.String(),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(s.expiry)),
 		},
+		Version: id.Version,
+	}
+	if id.Session != uuid.Nil {
+		claims.SessionID = id.Session.String()
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString(s.secret)
@@ -70,6 +107,12 @@ func (s *TokenService) Issue(userID uuid.UUID) (string, error) {
 // expiry, and extracts the user id without any panicking type assertion.
 // Malformed, expired, wrong-alg, or otherwise invalid tokens yield an error.
 func (s *TokenService) Verify(tokenString string) (uuid.UUID, error) {
+	id, err := s.VerifyIdentity(tokenString)
+	return id.UserID, err
+}
+
+// VerifyIdentity is Verify returning the token's full Identity.
+func (s *TokenService) VerifyIdentity(tokenString string) (Identity, error) {
 	claims := &Claims{}
 	token, err := jwt.ParseWithClaims(
 		tokenString,
@@ -85,19 +128,25 @@ func (s *TokenService) Verify(tokenString string) (uuid.UUID, error) {
 		jwt.WithExpirationRequired(),
 	)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("auth: verify token: %w", err)
+		return Identity{}, fmt.Errorf("auth: verify token: %w", err)
 	}
 	if !token.Valid {
-		return uuid.Nil, errors.New("auth: invalid token")
+		return Identity{}, errors.New("auth: invalid token")
 	}
 
 	subject, err := claims.GetSubject()
 	if err != nil || subject == "" {
-		return uuid.Nil, errors.New("auth: token has no subject")
+		return Identity{}, errors.New("auth: token has no subject")
 	}
 	userID, err := uuid.Parse(subject)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("auth: token subject is not a uuid: %w", err)
+		return Identity{}, fmt.Errorf("auth: token subject is not a uuid: %w", err)
 	}
-	return userID, nil
+	id := Identity{UserID: userID, Version: claims.Version}
+	if claims.SessionID != "" {
+		if id.Session, err = uuid.Parse(claims.SessionID); err != nil {
+			return Identity{}, fmt.Errorf("auth: token session is not a uuid: %w", err)
+		}
+	}
+	return id, nil
 }

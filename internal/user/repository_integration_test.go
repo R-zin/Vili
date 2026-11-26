@@ -278,3 +278,57 @@ func TestUserRepository_Integration_AccountLifecycle(t *testing.T) {
 		t.Fatalf("second delete: %v", err)
 	}
 }
+
+func TestUserRepository_Integration_SessionState(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	repo := user.NewPostgresRepository(db)
+	u, err := repo.Create(ctx, fmt.Sprintf("ss_%d", time.Now().UnixNano()), "h")
+	if err != nil || u.TokenVersion != 0 {
+		t.Fatalf("create: %v %+v", err, u)
+	}
+	fam := uuid.New()
+	if _, err := repo.InsertRefreshToken(ctx, u.ID, fam, fmt.Sprintf("h_%d", time.Now().UnixNano()), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := repo.SessionState(ctx, u.ID, fam)
+	if err != nil || !st.UserExists || st.Version != 0 || !st.SessionLive {
+		t.Fatalf("live session: %v %+v", err, st)
+	}
+	if st, _ := repo.SessionState(ctx, u.ID, uuid.Nil); !st.SessionLive {
+		t.Fatal("a token without a session is not session-bound")
+	}
+	if st, _ := repo.SessionState(ctx, u.ID, uuid.New()); st.SessionLive {
+		t.Fatal("unknown session must not be live")
+	}
+	other, _ := repo.Create(ctx, fmt.Sprintf("ss_o_%d", time.Now().UnixNano()), "h")
+	if st, _ := repo.SessionState(ctx, other.ID, fam); st.SessionLive {
+		t.Fatal("another user's session must not count")
+	}
+
+	v, err := repo.BumpTokenVersion(ctx, u.ID)
+	if err != nil || v != 1 {
+		t.Fatalf("bump: %d %v", v, err)
+	}
+	if got, _ := repo.ByUsername(ctx, u.Username); got.TokenVersion != 1 {
+		t.Fatalf("ByUsername version: %d", got.TokenVersion)
+	}
+	if _, err := repo.BumpTokenVersion(ctx, uuid.New()); !errors.Is(err, user.ErrNotFound) {
+		t.Fatalf("bump unknown: %v", err)
+	}
+
+	if err := repo.RevokeRefreshFamily(ctx, fam); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := repo.SessionState(ctx, u.ID, fam); st.SessionLive || st.Version != 1 {
+		t.Fatalf("revoked session: %+v", st)
+	}
+	if err := repo.Delete(ctx, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := repo.SessionState(ctx, u.ID, uuid.Nil); err != nil || st.UserExists {
+		t.Fatalf("deleted user: %v %+v", err, st)
+	}
+}

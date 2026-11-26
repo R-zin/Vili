@@ -89,6 +89,17 @@ func (f *fakeRepo) Delete(ctx context.Context, id uuid.UUID) error {
 	return ErrNotFound
 }
 
+func (f *fakeRepo) BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, error) {
+	for name, u := range f.byUsername {
+		if u.ID == id {
+			u.TokenVersion++
+			f.byUsername[name] = u
+			return u.TokenVersion, nil
+		}
+	}
+	return 0, ErrNotFound
+}
+
 // fakeRefreshStore is an in-memory auth.RefreshStore for tests. Tokens are
 // keyed by their (fake) hash; the store records revocations for assertions.
 type fakeRefreshStore struct {
