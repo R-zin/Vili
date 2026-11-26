@@ -98,7 +98,7 @@ func runRealtimeChat(ctx context.Context, out io.Writer, c *Client, roomID strin
 				return nil
 			default:
 				if _, err := c.SendMessage(ctx, roomID, line, ""); err != nil {
-					fmt.Fprintf(out, "  · send failed: %s\n", friendlyError(err))
+					fmt.Fprintf(out, "  %s %s\n", c.UI.style().Error("· send failed:"), friendlyError(err))
 				}
 			}
 
@@ -106,59 +106,65 @@ func runRealtimeChat(ctx context.Context, out io.Writer, c *Client, roomID strin
 			if !ok {
 				return errors.New("realtime connection closed")
 			}
-			renderEvent(out, e, c.Username)
+			renderEvent(out, e, c.UI.opts(c.Username), c.UI.bell())
 		}
 	}
 }
 
 // renderEvent writes one realtime event in chat form. The sender's own
 // message echo is indistinguishable from others' messages, so it renders the
-// same — the source of truth is the server.
-func renderEvent(out io.Writer, e wsEvent, me string) {
+// same — the source of truth is the server. When bell is set, a message that
+// @mentions the user also rings the terminal bell.
+func renderEvent(out io.Writer, e wsEvent, o printOpts, bell bool) {
+	st := o.Style
+	sys := func(text string) { fmt.Fprintln(out, "  "+st.System("· "+text)) }
 	switch e.Type {
 	case eventMessageNew:
 		var m Message
 		if err := json.Unmarshal(e.Payload, &m); err == nil {
-			printMessagesOpts(out, []Message{m}, printOpts{Me: me})
+			printMessagesOpts(out, []Message{m}, o)
+			if bell && mentionsMe(m, o.Me) {
+				fmt.Fprint(out, "\a")
+			}
 		}
 	case eventMessageEdited:
 		var m Message
 		if err := json.Unmarshal(e.Payload, &m); err == nil {
-			fmt.Fprintf(out, "  · edited: %s\n", formatMessage(m, printOpts{Me: me}))
+			fmt.Fprintf(out, "  %s %s\n", st.System("· edited:"), formatMessage(m, o))
 		}
 	case eventMessageDeleted:
 		var p struct {
 			ID string `json:"id"`
 		}
 		if err := json.Unmarshal(e.Payload, &p); err == nil && p.ID != "" {
-			fmt.Fprintf(out, "  · message %s was deleted\n", shortID(p.ID))
+			sys(fmt.Sprintf("message %s was deleted", shortID(p.ID)))
 		}
 	case eventTyping:
 		var p typingPayload
 		if err := json.Unmarshal(e.Payload, &p); err == nil && p.Username != "" {
-			fmt.Fprintf(out, "  · %s is typing…\n", sanitizeTerminal(p.Username))
+			sys(sanitizeTerminal(p.Username) + " is typing…")
 		}
 	case eventPresenceJoin:
 		var p presencePayload
 		if err := json.Unmarshal(e.Payload, &p); err == nil && p.Username != "" {
-			fmt.Fprintf(out, "  · %s joined\n", sanitizeTerminal(p.Username))
+			fmt.Fprintf(out, "  %s %s %s\n", st.Success("→"), st.User(sanitizeTerminal(p.Username)), st.System("joined"))
 		}
 	case eventPresenceLeave:
 		var p presencePayload
 		if err := json.Unmarshal(e.Payload, &p); err == nil && p.Username != "" {
-			fmt.Fprintf(out, "  · %s left\n", sanitizeTerminal(p.Username))
+			fmt.Fprintf(out, "  %s %s %s\n", st.Muted("←"), st.User(sanitizeTerminal(p.Username)), st.System("left"))
 		}
 	case eventPresenceState:
 		var p presencePayload
 		if err := json.Unmarshal(e.Payload, &p); err == nil {
 			if len(p.Online) == 0 {
-				fmt.Fprintln(out, "  · you're the only one here")
+				sys("you're the only one here")
 			} else {
-				var safeOnline []string
+				safe := make([]string, 0, len(p.Online))
 				for _, user := range p.Online {
-					safeOnline = append(safeOnline, sanitizeTerminal(user))
+					safe = append(safe, st.User(sanitizeTerminal(user)))
 				}
-				fmt.Fprintf(out, "  · online: %s\n", strings.Join(safeOnline, ", "))
+				fmt.Fprintf(out, "  %s %s\n", st.System("· online:"), strings.Join(safe, ", "))
 			}
 		}
 	}

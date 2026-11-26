@@ -35,6 +35,12 @@ type Client struct {
 	// flag @mentions in rendered messages. Empty when unknown.
 	Username string
 
+	// UI is the presentation for this invocation (nil renders plain text).
+	UI *UI
+	// Busy, when set, is called as each request starts; the returned func is
+	// called when it ends. The CLI uses it to show a spinner.
+	Busy func() (done func())
+
 	// OnTokenRefresh is called after a successful silent renewal so the caller
 	// can persist the rotated token pair. Nil disables silent renewal.
 	OnTokenRefresh func(access, refresh string, expiry time.Time)
@@ -95,6 +101,10 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 
 // doOnce performs a single request attempt with the client's current token.
 func (c *Client) doOnce(ctx context.Context, method, path string, query url.Values, body, out any) error {
+	if c.Busy != nil {
+		done := c.Busy()
+		defer done()
+	}
 	u := c.BaseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
