@@ -409,9 +409,9 @@ func TestRenderEvent_NewTypes(t *testing.T) {
 	var out bytes.Buffer
 	edited := time.Now()
 	p, _ := json.Marshal(Message{Username: "al", Content: "fixed", EditedAt: &edited, CreatedAt: time.Now()})
-	renderEvent(&out, wsEvent{Type: eventMessageEdited, Payload: p}, "")
+	renderEvent(&out, wsEvent{Type: eventMessageEdited, Payload: p}, printOpts{}, false)
 	d, _ := json.Marshal(map[string]string{"id": "0123456789abcdef"})
-	renderEvent(&out, wsEvent{Type: eventMessageDeleted, Payload: d}, "")
+	renderEvent(&out, wsEvent{Type: eventMessageDeleted, Payload: d}, printOpts{}, false)
 	for _, w := range []string{"edited:", "fixed (edited)", "message 01234567 was deleted"} {
 		if !strings.Contains(out.String(), w) {
 			t.Errorf("missing %q in %q", w, out.String())
@@ -419,8 +419,8 @@ func TestRenderEvent_NewTypes(t *testing.T) {
 	}
 	// Malformed payloads must not panic or print.
 	out.Reset()
-	renderEvent(&out, wsEvent{Type: eventMessageEdited, Payload: []byte("nope")}, "")
-	renderEvent(&out, wsEvent{Type: eventMessageDeleted, Payload: []byte(`{}`)}, "")
+	renderEvent(&out, wsEvent{Type: eventMessageEdited, Payload: []byte("nope")}, printOpts{}, false)
+	renderEvent(&out, wsEvent{Type: eventMessageDeleted, Payload: []byte(`{}`)}, printOpts{}, false)
 	if out.Len() != 0 {
 		t.Fatalf("expected silence, got %q", out.String())
 	}

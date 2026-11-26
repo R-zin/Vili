@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 
@@ -17,7 +16,7 @@ func main() {
 	defer stop()
 
 	if err := cli.Run(ctx, os.Stdout, os.Stdin, os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "vili:", err)
+		cli.PrintError(err)
 		os.Exit(1)
 	}
 }

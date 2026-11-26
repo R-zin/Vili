@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 )
@@ -68,42 +69,74 @@ Messages:
   search <query...> [--room ID] [--limit N]
   chat <room-id>                     live view: realtime messages, presence, typing
 
+Look & feel:
+  theme                              interactive theme picker (arrow keys, live preview)
+  theme list | set <name> | preview [name]
+  config                             show settings and the keys you can change
+  config set <key> <value>           e.g. config set color.mention "#ff79c6"
+  config unset <key> | reset | path
+
   version                            print the build version
 
 Global flags:
   --server URL   backend base URL (default http://localhost:8080; persists in session)
   --token  JWT   override the saved session token
+  --theme NAME   use a theme for this command only (or VILI_THEME)
+  --color MODE   auto | always | never (or VILI_COLOR; NO_COLOR is honored)
+  --no-anim      disable spinners and animations (or VILI_NO_ANIM=1)
 `
 
 // Run dispatches a subcommand. out receives normal output; in supplies stdin
 // for interactive commands (chat). Errors are returned, not printed, so main
 // stays a thin wrapper.
 func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error {
-	if len(args) == 0 {
-		fmt.Fprint(out, usage)
-		return errors.New("no command given")
-	}
-
 	// Global flags that may precede the subcommand.
 	fs := flag.NewFlagSet("vili", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	server := fs.String("server", "", "backend base URL")
 	tokenOverride := fs.String("token", "", "override session token")
+	themeFlag := fs.String("theme", "", "theme for this invocation")
+	colorFlag := fs.String("color", "", "auto|always|never")
+	noAnim := fs.Bool("no-anim", false, "disable animations")
 	rest, err := parseLeadingFlags(fs, args)
+
+	// Presentation: saved prefs + flags + environment. A broken config file
+	// must never brick the CLI (it would block `vili config reset`), so fall
+	// back to defaults with a warning.
+	prefs, perr := LoadPrefs()
+	if perr != nil {
+		fmt.Fprintf(stderr, "vili: warning: %v (using defaults; fix with: vili config reset)\n", perr)
+	}
+	ui, uerr := newUI(out, prefs, uiOverrides{Theme: *themeFlag, Color: *colorFlag, NoAnim: *noAnim}, os.Getenv)
+	if uerr != nil {
+		return uerr
+	}
+	for _, w := range ui.Warnings {
+		fmt.Fprintf(stderr, "vili: warning: %s (fix with: vili config)\n", w)
+	}
+
 	if err != nil {
-		fmt.Fprint(out, usage)
+		fmt.Fprint(out, renderUsage(ui.Style))
 		return err
 	}
 	if len(rest) == 0 {
-		fmt.Fprint(out, usage)
+		fmt.Fprint(out, renderUsage(ui.Style))
 		return errors.New("no command given")
 	}
 
 	cmd, cmdArgs := rest[0], rest[1:]
 
-	// version needs no session, client, or network.
-	if cmd == "version" {
+	// Commands that need no session, client, or network.
+	switch cmd {
+	case "version":
 		fmt.Fprintf(out, "vili %s\n", version)
+		return nil
+	case "theme", "themes":
+		return cmdTheme(out, in, ui, cmdArgs)
+	case "config":
+		return cmdConfig(out, ui, cmdArgs)
+	case "help", "--help", "-h":
+		fmt.Fprint(out, renderUsage(ui.Style))
 		return nil
 	}
 
@@ -120,6 +153,12 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 	if sess != nil {
 		client.Username = sess.User.Username
 	}
+	client.UI = ui
+	label := spinLabels[cmd]
+	if label == "" {
+		label = "talking to " + baseURL
+	}
+	client.Busy = func() func() { return ui.Spin(label) }
 	// Wire silent renewal: when the access token nears expiry, the client
 	// rotates it with the stored refresh token and persists the new pair.
 	if sess != nil && *tokenOverride == "" {
@@ -192,13 +231,44 @@ func Run(ctx context.Context, out io.Writer, in io.Reader, args []string) error 
 		return cmdSearch(ctx, out, client, cmdArgs)
 	case "chat":
 		return cmdChat(ctx, out, in, client, cmdArgs)
-	case "help", "--help", "-h":
-		fmt.Fprint(out, usage)
-		return nil
 	default:
-		fmt.Fprint(out, usage)
+		fmt.Fprint(out, renderUsage(ui.Style))
 		return fmt.Errorf("unknown command %q", cmd)
 	}
+}
+
+// spinLabels are the spinner captions shown while a command waits on the
+// server.
+var spinLabels = map[string]string{
+	"register": "creating your account", "login": "signing in", "rooms": "loading rooms",
+	"unread": "checking unread", "history": "loading history", "send": "sending",
+	"search": "searching", "chat": "joining", "members": "loading members",
+	"invite": "minting invite", "redeem": "redeeming invite", "dm": "opening conversation",
+	"passwd": "updating password", "sessions": "loading sessions", "whoami": "loading profile",
+}
+
+// renderUsage colors the help text: section headings and command names.
+func renderUsage(st *Style) string {
+	if !st.Enabled() {
+		return usage
+	}
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(usage, "\n") {
+		trimmed := strings.TrimRight(line, "\n")
+		switch {
+		case strings.HasPrefix(trimmed, "vili —"):
+			b.WriteString(st.Gradient(trimmed, 0, gradientStops(st.Theme())...) + "\n")
+		case trimmed != "" && !strings.HasPrefix(trimmed, " ") && strings.HasSuffix(trimmed, ":"):
+			b.WriteString(st.Accent(trimmed) + "\n")
+		case strings.HasPrefix(trimmed, "  ") && !strings.HasPrefix(trimmed, "   "):
+			body := trimmed[2:]
+			word, tail, _ := strings.Cut(body, " ")
+			b.WriteString("  " + st.paint(word, st.Theme().Accent) + " " + st.Muted(tail) + "\n")
+		default:
+			b.WriteString(line)
+		}
+	}
+	return b.String()
 }
 
 // sessionToken prefers an explicit override, else the saved session token.
@@ -244,7 +314,7 @@ func cmdRegister(ctx context.Context, out io.Writer, in io.Reader, c *Client, ar
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "registered %s (id %s) — now run: vili login %s <password>\n", u.Username, u.ID, u.Username)
+	c.UI.ok(out, "registered %s (id %s) — now run: vili login %s <password>", u.Username, u.ID, u.Username)
 	return nil
 }
 
@@ -270,7 +340,12 @@ func cmdLogin(ctx context.Context, out io.Writer, in io.Reader, c *Client, baseU
 	if err := sess.Save(); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "logged in as %s — session saved\n", resp.User.Username)
+	name := sanitizeTerminal(resp.User.Username)
+	if st := c.UI.style(); st.Enabled() {
+		c.UI.Typewrite(out, st.Success("✓")+" logged in as "+st.User(name)+" "+st.Muted("— session saved")+" "+st.Mention("✦"))
+	} else {
+		fmt.Fprintf(out, "logged in as %s — session saved\n", name)
+	}
 	return nil
 }
 
@@ -281,7 +356,7 @@ func cmdLogout(ctx context.Context, out io.Writer, c *Client) error {
 	if err := ClearSession(); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "logged out — session cleared")
+	c.UI.ok(out, "logged out — session cleared")
 	return nil
 }
 
@@ -292,7 +367,7 @@ func cmdJoin(ctx context.Context, out io.Writer, c *Client, args []string) error
 	if err := c.Join(ctx, args[0]); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "joined")
+	c.UI.ok(out, "joined")
 	return nil
 }
 
@@ -303,7 +378,7 @@ func cmdLeave(ctx context.Context, out io.Writer, c *Client, args []string) erro
 	if err := c.Leave(ctx, args[0]); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "left")
+	c.UI.ok(out, "left")
 	return nil
 }
 
@@ -331,7 +406,9 @@ func cmdHistory(ctx context.Context, out io.Writer, c *Client, args []string) er
 	if err != nil {
 		return err
 	}
-	printMessagesOpts(out, messages, printOpts{IDs: *ids, Me: c.Username})
+	o := c.UI.opts(c.Username)
+	o.IDs = *ids
+	printMessagesOpts(out, messages, o)
 	return nil
 }
 
@@ -341,6 +418,11 @@ type printOpts struct {
 	IDs bool
 	// Me is the signed-in username; messages that @mention it are flagged.
 	Me string
+	// Style colors the output; nil renders plain text.
+	Style *Style
+	// TimeLayout formats timestamps ("" hides them; zero value means 15:04:05
+	// when Style is nil, so plain callers keep the historical format).
+	TimeLayout string
 }
 
 // printMessages writes messages oldest-first in a chat-like form,
@@ -355,37 +437,118 @@ func printMessagesOpts(out io.Writer, messages []Message, o printOpts) {
 	}
 }
 
-// formatMessage renders one message. Untrusted fields are sanitized. Deleted
-// messages show a tombstone, edited ones are marked, replies show the short id
-// of their target, and messages that @mention the signed-in user are flagged
-// with a leading "»".
-func formatMessage(m Message, o printOpts) string {
-	var b strings.Builder
-	if o.Me != "" && !m.Deleted {
-		for _, name := range m.Mentions {
-			if name == o.Me {
-				b.WriteString("» ")
-				break
-			}
+// mentionsMe reports whether m @mentions the signed-in user.
+func mentionsMe(m Message, me string) bool {
+	if me == "" || m.Deleted {
+		return false
+	}
+	for _, name := range m.Mentions {
+		if name == me {
+			return true
 		}
 	}
-	if o.IDs {
-		b.WriteString(m.ID + "  ")
+	return false
+}
+
+// formatMessage renders one message. Untrusted fields are sanitized BEFORE any
+// styling is added, so a message can never inject escape codes of its own.
+// Deleted messages show a tombstone, edited ones are marked, replies show the
+// short id of their target, and messages that @mention the signed-in user are
+// flagged with a leading "»". Multi-line diff/code/log/commit payloads are
+// shown in an indented gutter.
+func formatMessage(m Message, o printOpts) string {
+	st := o.Style
+	layout := o.TimeLayout
+	if layout == "" && st == nil {
+		layout = "15:04:05"
 	}
-	fmt.Fprintf(&b, "%s  %s", m.CreatedAt.Local().Format("15:04:05"), sanitizeTerminal(m.Username))
+	var b strings.Builder
+	if mentionsMe(m, o.Me) {
+		b.WriteString(st.Mention("»") + " ")
+	}
+	if o.IDs {
+		b.WriteString(st.Muted(m.ID) + "  ")
+	}
+	if layout != "" {
+		b.WriteString(st.Time(m.CreatedAt.Local().Format(layout)) + "  ")
+	}
+	b.WriteString(st.User(sanitizeTerminal(m.Username)))
 	if m.ReplyTo != "" {
-		fmt.Fprintf(&b, " (↪ %s)", shortID(m.ReplyTo))
+		b.WriteString(st.Muted(" (↪ " + shortID(m.ReplyTo) + ")"))
 	}
 	b.WriteString(": ")
 	if m.Deleted {
-		b.WriteString("[message deleted]")
+		b.WriteString(st.Muted(st.Italic("[message deleted]")))
 		return b.String()
 	}
-	b.WriteString(sanitizeTerminal(m.Content))
+	b.WriteString(renderContent(m.Type, sanitizeTerminal(m.Content), m.Mentions, o.Me, st))
 	if m.EditedAt != nil {
-		b.WriteString(" (edited)")
+		b.WriteString(st.Muted(" (edited)"))
 	}
 	return b.String()
+}
+
+// renderContent styles already-sanitized content by message type.
+func renderContent(typ, content string, mentions []string, me string, st *Style) string {
+	lineStyle := func(line string) string {
+		switch typ {
+		case "diff":
+			switch {
+			case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
+				return st.Bold(line)
+			case strings.HasPrefix(line, "+"):
+				return st.Add(line)
+			case strings.HasPrefix(line, "-"):
+				return st.Del(line)
+			case strings.HasPrefix(line, "@@"):
+				return st.Accent(line)
+			}
+			return line
+		case "code":
+			return st.Code(line)
+		case "log":
+			return st.Muted(line)
+		}
+		return line
+	}
+	gutterTypes := typ == "diff" || typ == "code" || typ == "log" || typ == "commit"
+	if gutterTypes && strings.Contains(content, "\n") {
+		var b strings.Builder
+		for i, line := range strings.Split(content, "\n") {
+			b.WriteString("\n  " + st.Muted("│") + " ")
+			if typ == "commit" && i == 0 {
+				b.WriteString(st.Accent(line))
+				continue
+			}
+			b.WriteString(lineStyle(line))
+		}
+		return b.String()
+	}
+	if typ == "commit" {
+		return st.Code(content)
+	}
+	if gutterTypes {
+		return lineStyle(content)
+	}
+	return highlightMentions(content, mentions, me, st)
+}
+
+// highlightMentions colors "@name" for each resolved mention: yours stand out,
+// others are accented. Plain styles return content unchanged.
+func highlightMentions(content string, mentions []string, me string, st *Style) string {
+	if !st.Enabled() || len(mentions) == 0 {
+		return content
+	}
+	pairs := make([]string, 0, 2*len(mentions))
+	for _, name := range mentions {
+		tag := "@" + name
+		if name == me {
+			pairs = append(pairs, tag, st.Mention(tag))
+		} else {
+			pairs = append(pairs, tag, st.Accent(tag))
+		}
+	}
+	return strings.NewReplacer(pairs...).Replace(content)
 }
 
 // shortID abbreviates a UUID for display.

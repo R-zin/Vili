@@ -38,7 +38,12 @@ func cmdChat(parent context.Context, out io.Writer, in io.Reader, c *Client, arg
 	if err != nil {
 		return err
 	}
-	printMessagesOpts(out, messages, printOpts{Me: c.Username})
+	// From here on, output interleaves with the user's typing: no spinners.
+	c.Busy = nil
+	if c.UI.style().Enabled() {
+		c.UI.Banner(out, "◆ vili · "+roomTitle(ctx, c, roomID))
+	}
+	printMessagesOpts(out, messages, c.UI.opts(c.Username))
 	cursor := cursorFrom(messages)
 
 	// Everything shown is now read; mark it so unread counters stay accurate,
@@ -54,7 +59,7 @@ func cmdChat(parent context.Context, out io.Writer, in io.Reader, c *Client, arg
 	// Try realtime first: open the websocket and, on success, run the live loop.
 	conn, err := c.watch(ctx, roomID)
 	if err == nil {
-		fmt.Fprintln(out, "— live chat: type a message and press enter; /quit to exit, /leave to leave —")
+		fmt.Fprintln(out, c.UI.style().Muted("— live chat: type a message and press enter; /quit to exit, /leave to leave —"))
 		defer conn.Close(websocket.StatusNormalClosure, "leaving")
 		push := make(chan wsEvent)
 		readEvents(conn, push)
@@ -64,6 +69,20 @@ func cmdChat(parent context.Context, out io.Writer, in io.Reader, c *Client, arg
 	// Fall back to polling when realtime is unavailable.
 	fmt.Fprintf(out, "— chat (polling, realtime unavailable: %s): /quit to exit, /leave to leave —\n", friendlyError(err))
 	return runPollingChat(ctx, out, in, c, roomID, cursor)
+}
+
+// roomTitle returns a display name for the room header, falling back to a
+// short id if the listing cannot be fetched.
+func roomTitle(ctx context.Context, c *Client, roomID string) string {
+	rooms, err := c.ListRoomsFiltered(ctx, "", true)
+	if err == nil {
+		for _, r := range rooms {
+			if r.ID == roomID {
+				return roomLabel(r)
+			}
+		}
+	}
+	return shortID(roomID)
 }
 
 // runPollingChat is the original poll-based view, kept as the fallback when no
@@ -152,7 +171,7 @@ func handleChatLine(ctx context.Context, out io.Writer, c *Client, roomID, line 
 	if err != nil {
 		return cursor, err
 	}
-	printMessages(out, fresh)
+	printMessagesOpts(out, fresh, c.UI.opts(c.Username))
 	if len(fresh) > 0 {
 		return cursorFrom(fresh), nil
 	}

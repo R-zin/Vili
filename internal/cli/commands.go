@@ -113,7 +113,7 @@ func cmdRooms(ctx context.Context, out io.Writer, c *Client, args []string) erro
 		fmt.Fprintln(out, "no rooms yet — create one with: vili create <name>")
 		return nil
 	}
-	printRooms(out, rooms)
+	printRooms(out, rooms, c.UI.style())
 	return nil
 }
 
@@ -132,7 +132,7 @@ func cmdUnread(ctx context.Context, out io.Writer, c *Client) error {
 		fmt.Fprintln(out, "all caught up")
 		return nil
 	}
-	printRooms(out, unread)
+	printRooms(out, unread, c.UI.style())
 	return nil
 }
 
@@ -144,21 +144,21 @@ func roomLabel(r Room) string {
 	return sanitizeTerminal(r.Name)
 }
 
-func printRooms(out io.Writer, rooms []Room) {
+func printRooms(out io.Writer, rooms []Room, st *Style) {
 	for _, r := range rooms {
 		var tags []string
 		if r.IsDM {
-			tags = append(tags, "dm")
+			tags = append(tags, st.System("dm"))
 		} else if r.IsPrivate {
-			tags = append(tags, "private")
+			tags = append(tags, st.System("private"))
 		}
 		if r.Role != "" && r.Role != "member" {
-			tags = append(tags, r.Role)
+			tags = append(tags, st.Accent(r.Role))
 		}
 		if r.Unread > 0 {
-			u := fmt.Sprintf("%d unread", r.Unread)
+			u := st.Warn(fmt.Sprintf("%d unread", r.Unread))
 			if r.UnreadMentions > 0 {
-				u += fmt.Sprintf(", %d @you", r.UnreadMentions)
+				u += ", " + st.Mention(fmt.Sprintf("%d @you", r.UnreadMentions))
 			}
 			tags = append(tags, u)
 		}
@@ -168,9 +168,15 @@ func printRooms(out io.Writer, rooms []Room) {
 		}
 		desc := ""
 		if r.Description != "" {
-			desc = "  — " + sanitizeTerminal(r.Description)
+			desc = st.Muted("  — " + sanitizeTerminal(r.Description))
 		}
-		fmt.Fprintf(out, "%s  %s%s%s\n", r.ID, roomLabel(r), suffix, desc)
+		label := roomLabel(r)
+		if r.IsDM {
+			label = st.User(label)
+		} else {
+			label = st.Bold(label)
+		}
+		fmt.Fprintf(out, "%s  %s%s%s\n", st.Muted(r.ID), label, suffix, desc)
 	}
 }
 
@@ -193,7 +199,7 @@ func cmdCreateRoom(ctx context.Context, out io.Writer, c *Client, args []string)
 	if r.IsPrivate {
 		kind = " (private)"
 	}
-	fmt.Fprintf(out, "created %s%s (id %s)\n", r.Name, kind, r.ID)
+	c.UI.ok(out, "created %s%s (id %s)", r.Name, kind, r.ID)
 	return nil
 }
 
@@ -228,7 +234,7 @@ func cmdEditRoom(ctx context.Context, out io.Writer, c *Client, args []string) e
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "updated %s\n", r.Name)
+	c.UI.ok(out, "updated %s", r.Name)
 	return nil
 }
 
@@ -245,7 +251,7 @@ func cmdDeleteRoom(ctx context.Context, out io.Writer, c *Client, args []string)
 	if err := c.DeleteRoom(ctx, pos[0]); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "room deleted")
+	c.UI.ok(out, "room deleted")
 	return nil
 }
 
@@ -256,7 +262,7 @@ func cmdRead(ctx context.Context, out io.Writer, c *Client, args []string) error
 	if err := c.MarkRead(ctx, args[0]); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "marked read")
+	c.UI.ok(out, "marked read")
 	return nil
 }
 
@@ -268,7 +274,7 @@ func cmdDM(ctx context.Context, out io.Writer, c *Client, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "direct message with %s (id %s) — vili chat %s\n", sanitizeTerminal(args[0]), r.ID, r.ID)
+	c.UI.ok(out, "direct message with %s (id %s) — vili chat %s", sanitizeTerminal(args[0]), r.ID, r.ID)
 	return nil
 }
 
@@ -283,7 +289,13 @@ func cmdMembers(ctx context.Context, out io.Writer, c *Client, args []string) er
 		return err
 	}
 	for _, m := range ms {
-		fmt.Fprintf(out, "%-10s %s\n", m.Role, sanitizeTerminal(m.Username))
+		role := fmt.Sprintf("%-10s", m.Role)
+		if m.Role != "member" {
+			role = c.UI.style().Accent(role)
+		} else {
+			role = c.UI.style().Muted(role)
+		}
+		fmt.Fprintf(out, "%s %s\n", role, c.UI.style().User(sanitizeTerminal(m.Username)))
 	}
 	return nil
 }
@@ -314,7 +326,7 @@ func cmdKick(ctx context.Context, out io.Writer, c *Client, args []string) error
 	if err := c.Kick(ctx, args[0], id); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "removed %s\n", sanitizeTerminal(args[1]))
+	c.UI.ok(out, "removed %s", sanitizeTerminal(args[1]))
 	return nil
 }
 
@@ -330,7 +342,7 @@ func cmdRole(ctx context.Context, out io.Writer, c *Client, role string, args []
 	if err := c.SetRole(ctx, args[0], id, role); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "%s is now %s\n", sanitizeTerminal(args[1]), role)
+	c.UI.ok(out, "%s is now %s", sanitizeTerminal(args[1]), role)
 	return nil
 }
 
@@ -346,6 +358,7 @@ func cmdInvite(ctx context.Context, out io.Writer, c *Client, args []string) err
 	if err != nil {
 		return err
 	}
+	// The code itself stays unstyled so it can be copied (and parsed) as is.
 	fmt.Fprintf(out, "invite code: %s\n(expires %s — shown once; share with: vili redeem %s)\n",
 		code, inv.ExpiresAt.Local().Format(time.RFC822), code)
 	return nil
@@ -377,7 +390,15 @@ func cmdInvites(ctx context.Context, out io.Writer, c *Client, args []string) er
 		if i.MaxUses > 0 {
 			limit = fmt.Sprint(i.MaxUses)
 		}
-		fmt.Fprintf(out, "%s  %-8s uses %d/%s  expires %s\n", i.ID, state, i.Uses, limit, i.ExpiresAt.Local().Format(time.RFC822))
+		st := c.UI.style()
+		stateStr := fmt.Sprintf("%-8s", state)
+		if state == "active" {
+			stateStr = st.Success(stateStr)
+		} else {
+			stateStr = st.Muted(stateStr)
+		}
+		fmt.Fprintf(out, "%s  %s uses %d/%s  %s\n", st.Muted(i.ID), stateStr, i.Uses, limit,
+			st.Muted("expires "+i.ExpiresAt.Local().Format(time.RFC822)))
 	}
 	return nil
 }
@@ -389,7 +410,7 @@ func cmdRevokeInvite(ctx context.Context, out io.Writer, c *Client, args []strin
 	if err := c.RevokeInvite(ctx, args[0], args[1]); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "invite revoked")
+	c.UI.ok(out, "invite revoked")
 	return nil
 }
 
@@ -401,7 +422,7 @@ func cmdRedeem(ctx context.Context, out io.Writer, c *Client, args []string) err
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "joined %s (id %s)\n", sanitizeTerminal(r.Name), r.ID)
+	c.UI.ok(out, "joined %s (id %s)", sanitizeTerminal(r.Name), r.ID)
 	return nil
 }
 
@@ -438,7 +459,7 @@ func cmdSend(ctx context.Context, out io.Writer, in io.Reader, c *Client, args [
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "sent (id %s)\n", m.ID)
+	c.UI.ok(out, "sent (id %s)", m.ID)
 	return nil
 }
 
@@ -453,7 +474,7 @@ func cmdEditMessage(ctx context.Context, out io.Writer, c *Client, args []string
 	if _, err := c.EditMessage(ctx, args[0], args[1], content); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "edited")
+	c.UI.ok(out, "edited")
 	return nil
 }
 
@@ -464,7 +485,7 @@ func cmdDeleteMessage(ctx context.Context, out io.Writer, c *Client, args []stri
 	if err := c.DeleteMessage(ctx, args[0], args[1]); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "deleted")
+	c.UI.ok(out, "deleted")
 	return nil
 }
 
@@ -485,10 +506,53 @@ func cmdSearch(ctx context.Context, out io.Writer, c *Client, args []string) err
 		return nil
 	}
 	for _, m := range ms {
-		fmt.Fprintf(out, "%s  #%s  ", m.CreatedAt.Local().Format("2006-01-02 15:04"), sanitizeTerminal(m.RoomName))
-		fmt.Fprintf(out, "%s: %s\n", sanitizeTerminal(m.Username), oneLine(sanitizeTerminal(m.Content)))
+		st := c.UI.style()
+		fmt.Fprintf(out, "%s  %s  ", st.Time(m.CreatedAt.Local().Format("2006-01-02 15:04")), st.Accent("#"+sanitizeTerminal(m.RoomName)))
+		fmt.Fprintf(out, "%s: %s\n", st.User(sanitizeTerminal(m.Username)), highlightTerms(oneLine(sanitizeTerminal(m.Content)), pos, st))
 	}
 	return nil
+}
+
+// highlightTerms emphasizes the plain search words in a result line.
+func highlightTerms(line string, terms []string, st *Style) string {
+	if !st.Enabled() {
+		return line
+	}
+	lower := strings.ToLower(line)
+	if len(lower) != len(line) {
+		return line // some runes change width when lowercased; skip rather than misalign
+	}
+	marks := make([]bool, len(line))
+	for _, t := range terms {
+		t = strings.ToLower(strings.Trim(t, `"-()`))
+		if len(t) < 2 || t == "or" {
+			continue
+		}
+		for from := 0; ; {
+			i := strings.Index(lower[from:], t)
+			if i < 0 {
+				break
+			}
+			for k := from + i; k < from+i+len(t); k++ {
+				marks[k] = true
+			}
+			from += i + len(t)
+		}
+	}
+	var b strings.Builder
+	for i := 0; i < len(line); {
+		j := i
+		for j < len(line) && marks[j] == marks[i] {
+			j++
+		}
+		if marks[i] {
+			b.WriteString(st.Mention(line[i:j]))
+		} else {
+			b.WriteString(line[i:j])
+		}
+		i = j
+	}
+	return b.String()
 }
 
 // oneLine collapses newlines so a result stays on a single row.
@@ -501,7 +565,7 @@ func cmdWhoami(ctx context.Context, out io.Writer, c *Client) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "%s (id %s) — member since %s — %s\n", sanitizeTerminal(u.Username), u.ID,
+	fmt.Fprintf(out, "%s (id %s) — member since %s — %s\n", c.UI.style().User(sanitizeTerminal(u.Username)), u.ID,
 		u.CreatedAt.Local().Format("2006-01-02"), c.BaseURL)
 	return nil
 }
@@ -527,7 +591,7 @@ func cmdPasswd(ctx context.Context, out io.Writer, in io.Reader, c *Client, args
 	}
 	// The server signed out every session; adopt the fresh one for this device.
 	c.applySession(resp)
-	fmt.Fprintln(out, "password changed — all other sessions were signed out")
+	c.UI.ok(out, "password changed — all other sessions were signed out")
 	return nil
 }
 
@@ -549,7 +613,7 @@ func cmdDeleteAccount(ctx context.Context, out io.Writer, in io.Reader, c *Clien
 		return err
 	}
 	_ = ClearSession()
-	fmt.Fprintln(out, "account deleted")
+	c.UI.ok(out, "account deleted")
 	return nil
 }
 
@@ -573,14 +637,14 @@ func cmdSessions(ctx context.Context, out io.Writer, c *Client, args []string) e
 		if err := c.RevokeSession(ctx, args[1]); err != nil {
 			return err
 		}
-		fmt.Fprintln(out, "session revoked")
+		c.UI.ok(out, "session revoked")
 		return nil
 	case len(args) == 1 && args[0] == "revoke-all":
 		if err := c.RevokeSession(ctx, ""); err != nil {
 			return err
 		}
 		_ = ClearSession() // this device's refresh token is gone too
-		fmt.Fprintln(out, "all sessions revoked — run: vili login")
+		c.UI.ok(out, "all sessions revoked — run: vili login")
 		return nil
 	}
 	return errors.New("usage: vili sessions [revoke <session-id> | revoke-all]")

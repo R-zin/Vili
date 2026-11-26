@@ -146,6 +146,9 @@ git diff | ./vili send <room-id> --file - --type diff
 
 # account
 ./vili whoami; ./vili sessions; ./vili passwd <current> <new>
+
+# look & feel (see Terminal look & feel)
+./vili theme                        # pick a theme with the arrow keys
 ```
 
 `--server URL` selects a backend (default `http://localhost:8080`; saved on login).
@@ -153,6 +156,50 @@ git diff | ./vili send <room-id> --file - --type diff
 **See it live:** run `./vili chat <room-id>` in two terminals (or open `index.html` in a
 browser as a second peer). A message sent from one appears in the other instantly, along
 with join/leave and typing indicators — no polling.
+
+## Terminal look & feel
+
+The CLI is themeable and animated, and stays scriptable: colors and animations
+switch on **only when output is a real terminal**, so pipes, scripts and CI get
+plain text exactly as before.
+
+```bash
+vili theme                     # interactive picker: ↑/↓ (or j/k, 1-9), enter to apply, q to cancel
+vili theme list                # all themes with color swatches
+vili theme set dracula         # classic, dracula, nord, gruvbox, solarized-dark,
+                               # solarized-light, catppuccin, matrix, mono
+vili theme preview nord        # sample conversation rendered in a theme
+vili --theme matrix rooms      # one-off theme for a single command
+
+vili config                    # show settings + every settable key
+vili config set color.mention "#ff79c6"   # override any theme color by role
+vili config set time-format 12h           # full | short | 12h | off
+vili config set bell on                   # ring the terminal bell on @mentions in chat
+vili config set animations off            # or --no-anim / VILI_NO_ANIM=1
+vili config set color never               # auto | always | never (or --color / VILI_COLOR)
+vili config reset
+```
+
+What it looks like:
+
+- **Messages** — stable per-user name colors, dimmed timestamps and ids, your
+  @mentions highlighted (and flagged with `»`), edited/deleted/reply markers.
+  `diff` messages render additions and removals in color inside a `│` gutter;
+  `code`, `log` and `commit` payloads get their own styling.
+- **Listings** — unread counters, `@you` mention counts, roles and private/DM
+  tags are color-coded; search results highlight the matched words.
+- **Animations** — a spinner (on stderr) while a request is in flight, shown
+  only if it takes longer than 150 ms and always erased before output prints;
+  a gradient banner that sweeps across when you enter `vili chat`; a typewriter
+  greeting on login; an animated title in the theme picker.
+
+Color depth is detected automatically (24-bit when `COLORTERM=truecolor`, else
+256-color). [`NO_COLOR`](https://no-color.org) and `TERM=dumb` turn colors and
+animations off. Settings live in `<config dir>/vili/config.json` (see
+`vili config path`); a corrupt file falls back to defaults with a warning.
+
+Message content is sanitized of escape sequences **before** styling is
+applied, so a message can never inject its own colors or terminal commands.
 
 ## API
 
@@ -379,7 +426,8 @@ Current green gate for CI: `go build ./...`, `go vet ./...`, `gofmt -l .` empty,
 
 Go 1.26 · `net/http` (ServeMux) · `github.com/jackc/pgx/v5` (stdlib `database/sql`) ·
 `github.com/golang-jwt/jwt/v5` · `golang.org/x/crypto/bcrypt` ·
-`github.com/coder/websocket` (real-time) · `golang.org/x/time/rate` (rate limiting) · PostgreSQL.
+`github.com/coder/websocket` (real-time) · `golang.org/x/time/rate` (rate limiting) ·
+`golang.org/x/term` (terminal detection and raw-mode input for the theme picker) · PostgreSQL.
 
 > **Dependency note:** the original Phase-1 whitelist excluded a websocket library
 > because real-time was out of scope then. Phase 4 adds `github.com/coder/websocket`
