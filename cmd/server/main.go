@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/R-zin/vili/internal/api"
 	"github.com/R-zin/vili/internal/auth"
+	"github.com/R-zin/vili/internal/bus"
 	"github.com/R-zin/vili/internal/config"
 	"github.com/R-zin/vili/internal/httputil"
 	"github.com/R-zin/vili/internal/message"
@@ -74,17 +77,70 @@ func run() error {
 	messageRepo := message.NewPostgresRepository(db)
 	userRepo := user.NewPostgresRepository(db)
 
+	// Cluster wiring: the bus carries broadcasts, evictions and revocations to
+	// every instance; presence is shared through Postgres.
+	bgCtx, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+	instance := cfg.WS.InstanceID
+	if instance == "" {
+		host, _ := os.Hostname()
+		instance = bus.NewInstanceID(host)
+	}
+	var (
+		eventBus bus.Bus = bus.NewLocal()
+		pgBus    *bus.Postgres
+	)
+	if cfg.WS.Bus == "postgres" {
+		pgBus = bus.NewPostgres(db, cfg.DatabaseURL, instance)
+		eventBus = pgBus
+		ready := make(chan struct{})
+		go pgBus.Run(bgCtx, ready)
+		select {
+		case <-ready:
+		case <-time.After(10 * time.Second):
+			slog.Warn("realtime bus not connected yet; /ready reports 503 until it is")
+		}
+		presence := ws.NewPGPresence(db, instance, hub.LocalPresence)
+		if err := presence.Register(context.Background()); err != nil {
+			return err
+		}
+		hub.UsePresence(presence)
+		go presence.Run(bgCtx, ws.PresenceHeartbeat)
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := presence.Deregister(ctx); err != nil {
+				slog.Warn("presence deregister failed", "error", err)
+			}
+		}()
+	}
+	hub.UseBus(eventBus)
+	slog.Info("realtime", "bus", cfg.WS.Bus, "instance", instance)
+
+	// Access tokens are checked against the session store (cached), so logout,
+	// "sign out everywhere", password changes and account deletion take effect
+	// at once on every instance; the bus invalidates every instance's cache.
+	sessions := auth.NewSessionCache(userRepo, cfg.WS.SessionCacheTTL)
+	tokens.SetValidator(sessions)
+	eventBus.Subscribe(func(m bus.Message) {
+		if m.Kind == bus.KindSessionRevoked {
+			sessions.Invalidate(m.User)
+		}
+	})
+	users := user.NewHandler(userRepo, tokens, userRepo, cfg.RefreshTokenTTL)
+	users.SetRevoker(hub)
+
 	// Wire each feature package's handler onto a single router, behind the
 	// Phase-5 middleware bundle (hardening, observability, rate limiting).
-	mw, stop := buildMiddleware(cfg, hub)
+	mw, stop := buildMiddleware(cfg, hub, pgBus)
 	defer stop()
 	handler := api.NewRouter(
-		user.NewHandler(userRepo, tokens, userRepo, cfg.RefreshTokenTTL),
+		users,
 		room.NewHandler(room.NewPostgresRepository(db), hub),
 		message.NewHandler(messageRepo, hub),
 		ws.NewHandler(hub, messageRepo, userRepo, cfg.Security.CORSAllowedOrigins...),
 		tokens,
-		db,
+		readiness{db: db, bus: pgBus},
 		mw,
 	)
 
@@ -100,7 +156,7 @@ func run() error {
 // the rate limiters' background sweepers. Everything is gated by config so a
 // zero-value-friendly composition (tests) still works: each knob can be turned
 // off without recompiling.
-func buildMiddleware(cfg config.Config, hub *ws.Hub) (api.Middleware, func()) {
+func buildMiddleware(cfg config.Config, hub *ws.Hub, pgBus *bus.Postgres) (api.Middleware, func()) {
 	var mw api.Middleware
 	var closers []func()
 
@@ -118,6 +174,22 @@ func buildMiddleware(cfg config.Config, hub *ws.Hub) (api.Middleware, func()) {
 			_, r := hub.Stats()
 			return float64(r)
 		})
+		if pgBus != nil {
+			reg.GaugeFunc("vili_bus_connected", "1 when this instance's cluster bus listener is connected.", func() float64 {
+				if pgBus.Connected() {
+					return 1
+				}
+				return 0
+			})
+			reg.GaugeFunc("vili_bus_published", "Bus messages published by this instance since start.", func() float64 {
+				p, _ := pgBus.Stats()
+				return float64(p)
+			})
+			reg.GaugeFunc("vili_bus_received", "Bus messages received from other instances since start.", func() float64 {
+				_, r := pgBus.Stats()
+				return float64(r)
+			})
+		}
 	}
 
 	// Rate limiting: per-IP on auth, per-user on message POSTs.
@@ -161,4 +233,22 @@ func buildMiddleware(cfg config.Config, hub *ws.Hub) (api.Middleware, func()) {
 			c()
 		}
 	}
+}
+
+// readiness reports ready only when the database answers and, in cluster
+// mode, the bus listener is connected (otherwise this instance would serve
+// stale realtime state, so the load balancer should route around it).
+type readiness struct {
+	db  *sql.DB
+	bus *bus.Postgres
+}
+
+func (r readiness) PingContext(ctx context.Context) error {
+	if err := r.db.PingContext(ctx); err != nil {
+		return err
+	}
+	if r.bus != nil && !r.bus.Connected() {
+		return errors.New("realtime bus disconnected")
+	}
+	return nil
 }

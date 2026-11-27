@@ -1,8 +1,10 @@
 // Package ws is the realtime websocket feature: it owns the in-memory Hub
 // (per-room connection registry), the per-connection Client pumps, and the
-// membership-gated GET /v1/rooms/{id}/ws handler. It is single-process and
-// in-memory only (no cross-node fan-out), which is the right scope for
-// Phase-4 realtime delivery.
+// membership-gated GET /v1/rooms/{id}/ws handler. Each process keeps its own
+// connections in memory; broadcasts, evictions and session revocations travel
+// between instances over the cluster bus (internal/bus), and presence can be
+// made cluster-wide with a PresenceStore (PGPresence), so any number of
+// instances can serve the same rooms.
 //
 // Like every feature package it is self-contained: it never imports the other
 // feature packages. It depends on narrow interfaces (membership checking and
@@ -39,4 +41,21 @@ type MembershipChecker interface {
 // lookup; it is satisfied by the user repository's UsernameByID.
 type UsernameResolver interface {
 	UsernameByID(ctx context.Context, id uuid.UUID) (string, error)
+}
+
+// PresenceEntry is one (room, user) with its connection count on an instance.
+type PresenceEntry struct {
+	Room     uuid.UUID
+	User     uuid.UUID
+	Username string
+	Conns    int
+}
+
+// PresenceStore tracks who is online across all instances. Add/Remove are
+// called as this instance's sockets open and close; Online answers for the
+// whole cluster.
+type PresenceStore interface {
+	Add(ctx context.Context, roomID, userID uuid.UUID, username string) error
+	Remove(ctx context.Context, roomID, userID uuid.UUID) error
+	Online(ctx context.Context, roomID uuid.UUID) ([]string, error)
 }

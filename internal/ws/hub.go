@@ -1,13 +1,20 @@
 package ws
 
 import (
+	"context"
+	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
+	"github.com/R-zin/vili/internal/bus"
 	"github.com/R-zin/vili/internal/event"
 )
+
+// busTimeout bounds one publish to the cluster bus.
+const busTimeout = 5 * time.Second
 
 // Hub is the in-memory registry of live websocket connections grouped by room.
 // It fans events out to a room's clients and tracks who is online. It never
@@ -28,11 +35,61 @@ type Hub struct {
 	// closed reports whether Close has been called; a closed hub rejects new
 	// joins so no client outlives shutdown.
 	closed bool
+
+	// bus carries broadcasts and evictions to every instance (including this
+	// one). presence, when set, is the cluster-wide "who is online" store;
+	// otherwise presence is this process's connections only.
+	bus      bus.Bus
+	presence PresenceStore
 }
 
-// NewHub builds an empty Hub with no per-user connection cap.
+// NewHub builds an empty Hub with no per-user connection cap, delivering
+// through an in-process bus (single instance).
 func NewHub() *Hub {
-	return &Hub{rooms: make(map[uuid.UUID]map[*Client]struct{}), userCounts: make(map[uuid.UUID]int)}
+	h := &Hub{rooms: make(map[uuid.UUID]map[*Client]struct{}), userCounts: make(map[uuid.UUID]int)}
+	h.UseBus(bus.NewLocal())
+	return h
+}
+
+// UseBus routes the hub's broadcasts and evictions through b and subscribes to
+// it, so events published by any instance reach this hub's connections. Call
+// it during wiring, before serving.
+func (h *Hub) UseBus(b bus.Bus) {
+	h.bus = b
+	b.Subscribe(h.onBus)
+}
+
+// UsePresence makes presence cluster-wide via p. Call it during wiring.
+func (h *Hub) UsePresence(p PresenceStore) { h.presence = p }
+
+// onBus applies a bus message to this instance's connections.
+func (h *Hub) onBus(m bus.Message) {
+	switch m.Kind {
+	case bus.KindRoomEvent:
+		if m.Event != nil {
+			h.broadcastLocal(m.Room, *m.Event)
+		}
+	case bus.KindDisconnect:
+		h.closeMatching(func(room uuid.UUID, c *Client) bool { return room == m.Room && c.userID == m.User },
+			websocket.StatusPolicyViolation, "no longer a member of this room")
+	case bus.KindCloseRoom:
+		h.closeMatching(func(room uuid.UUID, _ *Client) bool { return room == m.Room },
+			websocket.StatusGoingAway, "room deleted")
+	case bus.KindSessionRevoked:
+		h.closeMatching(func(_ uuid.UUID, c *Client) bool {
+			return c.userID == m.User && (m.Session == uuid.Nil || c.session == m.Session)
+		}, websocket.StatusPolicyViolation, "session ended")
+	}
+}
+
+// publish sends m through the bus, logging (not returning) failures: the
+// local delivery has already happened and durable state is in Postgres.
+func (h *Hub) publish(m bus.Message) {
+	ctx, cancel := context.WithTimeout(context.Background(), busTimeout)
+	defer cancel()
+	if err := h.bus.Publish(ctx, m); err != nil {
+		slog.Warn("realtime: cluster publish failed; other instances miss this update", "kind", m.Kind, "error", err)
+	}
 }
 
 // SetMaxConnsPerUser sets the concurrent-connection cap applied per user. A
@@ -86,9 +143,15 @@ func (h *Hub) Leave(roomID uuid.UUID, c *Client) {
 	}
 }
 
-// Broadcast enqueues e for every client in roomID. It is non-blocking: a
-// client whose buffer is full is dropped via its sendNow slow-consumer path.
+// Broadcast delivers e to every connection in roomID on every instance.
 func (h *Hub) Broadcast(roomID uuid.UUID, e event.Event) {
+	h.publish(bus.Message{Kind: bus.KindRoomEvent, Room: roomID, Event: &e})
+}
+
+// broadcastLocal enqueues e for every client of this instance in roomID. It is
+// non-blocking: a client whose buffer is full is dropped via its sendNow
+// slow-consumer path.
+func (h *Hub) broadcastLocal(roomID uuid.UUID, e event.Event) {
 	h.mu.RLock()
 	set := h.rooms[roomID]
 	clients := make([]*Client, 0, len(set))
@@ -102,33 +165,39 @@ func (h *Hub) Broadcast(roomID uuid.UUID, e event.Event) {
 	}
 }
 
-// Disconnect closes every connection userID holds to roomID, used when the
-// user is removed from (or leaves) the room so they stop receiving its traffic
-// at once. Unknown rooms/users are a no-op.
+// Disconnect closes every connection userID holds to roomID, on every
+// instance, used when the user is removed from (or leaves) the room so they
+// stop receiving its traffic at once.
 func (h *Hub) Disconnect(roomID, userID uuid.UUID) {
+	h.publish(bus.Message{Kind: bus.KindDisconnect, Room: roomID, User: userID})
+}
+
+// CloseRoom closes every connection to roomID on every instance (deleted room).
+func (h *Hub) CloseRoom(roomID uuid.UUID) {
+	h.publish(bus.Message{Kind: bus.KindCloseRoom, Room: roomID})
+}
+
+// RevokeSession closes userID's connections on every instance — all of them
+// when session is uuid.Nil, else only those opened with that session — and
+// tells every instance to drop cached session state for the user.
+func (h *Hub) RevokeSession(userID, session uuid.UUID) {
+	h.publish(bus.Message{Kind: bus.KindSessionRevoked, User: userID, Session: session})
+}
+
+// closeMatching closes this instance's clients selected by match.
+func (h *Hub) closeMatching(match func(room uuid.UUID, c *Client) bool, status websocket.StatusCode, reason string) {
 	h.mu.RLock()
 	var victims []*Client
-	for c := range h.rooms[roomID] {
-		if c.userID == userID {
-			victims = append(victims, c)
+	for room, set := range h.rooms {
+		for c := range set {
+			if match(room, c) {
+				victims = append(victims, c)
+			}
 		}
 	}
 	h.mu.RUnlock()
 	for _, c := range victims {
-		c.close(websocket.StatusPolicyViolation, "no longer a member of this room")
-	}
-}
-
-// CloseRoom closes every connection to roomID, used when the room is deleted.
-func (h *Hub) CloseRoom(roomID uuid.UUID) {
-	h.mu.RLock()
-	victims := make([]*Client, 0, len(h.rooms[roomID]))
-	for c := range h.rooms[roomID] {
-		victims = append(victims, c)
-	}
-	h.mu.RUnlock()
-	for _, c := range victims {
-		c.close(websocket.StatusGoingAway, "room deleted")
+		c.close(status, reason)
 	}
 }
 
@@ -159,7 +228,63 @@ func (h *Hub) MaxConnsPerUser() int {
 	return h.maxPerUser
 }
 
-// Presence returns the deduplicated usernames currently connected to roomID.
+// Online returns who is connected to roomID: cluster-wide when a presence
+// store is configured (falling back to this instance if it fails), else this
+// instance's connections.
+func (h *Hub) Online(ctx context.Context, roomID uuid.UUID) []string {
+	if h.presence != nil {
+		online, err := h.presence.Online(ctx, roomID)
+		if err == nil {
+			return online
+		}
+		slog.Warn("realtime: presence lookup failed; showing this instance only", "error", err)
+	}
+	return h.Presence(roomID)
+}
+
+// trackPresence records a connection opening (delta +1) or closing (-1) in the
+// cluster presence store, if any.
+func (h *Hub) trackPresence(ctx context.Context, c *Client, delta int) {
+	if h.presence == nil {
+		return
+	}
+	var err error
+	if delta > 0 {
+		err = h.presence.Add(ctx, c.roomID, c.userID, c.username)
+	} else {
+		err = h.presence.Remove(ctx, c.roomID, c.userID)
+	}
+	if err != nil {
+		slog.Warn("realtime: presence update failed", "error", err)
+	}
+}
+
+// LocalPresence lists every (room, user) this instance holds connections for,
+// with their counts, so a presence store can be rebuilt after it lost state.
+func (h *Hub) LocalPresence() []PresenceEntry {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	type key struct{ room, user uuid.UUID }
+	counts := map[key]*PresenceEntry{}
+	var out []PresenceEntry
+	for room, set := range h.rooms {
+		for c := range set {
+			k := key{room, c.userID}
+			if e, ok := counts[k]; ok {
+				e.Conns++
+				continue
+			}
+			counts[k] = &PresenceEntry{Room: room, User: c.userID, Username: c.username, Conns: 1}
+		}
+	}
+	for _, e := range counts {
+		out = append(out, *e)
+	}
+	return out
+}
+
+// Presence returns the deduplicated usernames connected to roomID on this
+// instance.
 func (h *Hub) Presence(roomID uuid.UUID) []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

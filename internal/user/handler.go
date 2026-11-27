@@ -36,6 +36,17 @@ type Handler struct {
 	tokens     *auth.TokenService
 	refresh    auth.RefreshStore
 	refreshTTL time.Duration
+	revoker    Revoker
+}
+
+// SetRevoker installs the hook told about ended sessions; call during wiring.
+func (h *Handler) SetRevoker(r Revoker) { h.revoker = r }
+
+// revoked notifies the revoker, if any.
+func (h *Handler) revoked(userID, session uuid.UUID) {
+	if h.revoker != nil {
+		h.revoker.RevokeSession(userID, session)
+	}
 }
 
 // NewHandler builds a user Handler. refreshTTL is how long a refresh token
@@ -204,6 +215,8 @@ func (h *Handler) refreshHandler(w http.ResponseWriter, r *http.Request) {
 			respond.Errorf(w, http.StatusInternalServerError, "internal", "could not refresh", err)
 			return
 		}
+		// The thief's access tokens for this session die with it.
+		h.revoked(rt.UserID, rt.FamilyID)
 		respond.Error(w, http.StatusUnauthorized, "unauthorized", "refresh token reuse detected")
 		return
 	}
@@ -234,6 +247,7 @@ func (h *Handler) refreshHandler(w http.ResponseWriter, r *http.Request) {
 			// Concurrency race: token was already consumed by a concurrent request.
 			// Treat as theft/reuse and revoke entire family immediately.
 			_ = h.refresh.RevokeRefreshFamily(r.Context(), rt.FamilyID)
+			h.revoked(rt.UserID, rt.FamilyID)
 			respond.Error(w, http.StatusUnauthorized, "unauthorized", "refresh token reuse detected")
 			return
 		}
@@ -255,12 +269,17 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RefreshToken != "" {
 		hash := auth.HashRefresh(req.RefreshToken)
-		if rt, err := h.refresh.RefreshTokenByHash(r.Context(), hash); err == nil {
+		rt, lookupErr := h.refresh.RefreshTokenByHash(r.Context(), hash)
+		if lookupErr == nil {
 			_ = h.refresh.RevokeRefreshFamily(r.Context(), rt.FamilyID)
 		}
 		if err := h.refresh.RevokeRefreshToken(r.Context(), hash); err != nil {
 			respond.Errorf(w, http.StatusInternalServerError, "internal", "could not log out", err)
 			return
+		}
+		if lookupErr == nil {
+			// The session's access tokens stop working now, not at expiry.
+			h.revoked(rt.UserID, rt.FamilyID)
 		}
 	}
 	respond.JSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
@@ -271,7 +290,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 // caller can mark the rotated-from token consumed). ExpiresAt is the access
 // token's expiry, which the CLI uses to renew proactively.
 func (h *Handler) mintPair(ctx context.Context, u User, family uuid.UUID) (loginResponse, uuid.UUID, error) {
-	access, err := h.tokens.Issue(u.ID)
+	access, err := h.tokens.IssueFor(auth.Identity{UserID: u.ID, Session: family, Version: u.TokenVersion})
 	if err != nil {
 		return loginResponse{}, uuid.Nil, err
 	}
@@ -391,8 +410,9 @@ func (h *Handler) changePassword(w http.ResponseWriter, r *http.Request) {
 		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not change password", err)
 		return
 	}
-	// A password change must evict anyone holding a stolen refresh token.
-	if err := h.refresh.RevokeAllSessions(r.Context(), u.ID); err != nil {
+	// A password change must evict anyone holding a stolen token: every
+	// refresh token is deleted and the version bump kills every access token.
+	if err := h.endAllSessions(r.Context(), &u); err != nil {
 		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not change password", err)
 		return
 	}
@@ -420,14 +440,11 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.repo.Delete(r.Context(), u.ID); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			respond.JSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-			return
-		}
+	if err := h.repo.Delete(r.Context(), u.ID); err != nil && !errors.Is(err, ErrNotFound) {
 		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not delete account", err)
 		return
 	}
+	h.revoked(u.ID, uuid.Nil)
 	respond.JSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -465,6 +482,7 @@ func (h *Handler) revokeSession(w http.ResponseWriter, r *http.Request) {
 		respond.Error(w, http.StatusNotFound, "not_found", "session not found")
 		return
 	}
+	h.revoked(id, family)
 	respond.JSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
 
@@ -474,9 +492,27 @@ func (h *Handler) revokeAllSessions(w http.ResponseWriter, r *http.Request) {
 		respond.Error(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 		return
 	}
-	if err := h.refresh.RevokeAllSessions(r.Context(), id); err != nil {
+	u := User{ID: id}
+	if err := h.endAllSessions(r.Context(), &u); err != nil {
 		respond.Errorf(w, http.StatusInternalServerError, "internal", "could not revoke sessions", err)
 		return
 	}
 	respond.JSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+// endAllSessions signs the user out everywhere: their refresh tokens are
+// deleted, the token version is bumped so outstanding access tokens are
+// rejected, and every instance is told to drop cached state and close the
+// user's sockets. u.TokenVersion is updated so a pair minted afterwards is valid.
+func (h *Handler) endAllSessions(ctx context.Context, u *User) error {
+	if err := h.refresh.RevokeAllSessions(ctx, u.ID); err != nil {
+		return err
+	}
+	v, err := h.repo.BumpTokenVersion(ctx, u.ID)
+	if err != nil {
+		return err
+	}
+	u.TokenVersion = v
+	h.revoked(u.ID, uuid.Nil)
+	return nil
 }

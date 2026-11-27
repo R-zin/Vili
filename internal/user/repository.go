@@ -33,9 +33,9 @@ func (r *PostgresRepository) Create(ctx context.Context, username, passwordHash 
 	err := r.db.QueryRowContext(ctx, `
 		INSERT INTO users (id, username, password_hash)
 		VALUES ($1, $2, $3)
-		RETURNING id, username, password_hash, created_at`,
+		RETURNING id, username, password_hash, created_at, token_version`,
 		u.ID, u.Username, u.PasswordHash,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt, &u.TokenVersion)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -50,10 +50,10 @@ func (r *PostgresRepository) Create(ctx context.Context, username, passwordHash 
 func (r *PostgresRepository) ByID(ctx context.Context, id uuid.UUID) (User, error) {
 	var u User
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, username, password_hash, created_at
+		SELECT id, username, password_hash, created_at, token_version
 		FROM users
 		WHERE id = $1`, id,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt, &u.TokenVersion)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
@@ -82,10 +82,10 @@ func (r *PostgresRepository) UsernameByID(ctx context.Context, id uuid.UUID) (st
 func (r *PostgresRepository) ByUsername(ctx context.Context, username string) (User, error) {
 	var u User
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, username, password_hash, created_at
+		SELECT id, username, password_hash, created_at, token_version
 		FROM users
 		WHERE username = $1`, username,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt, &u.TokenVersion)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
@@ -243,4 +243,41 @@ func (r *PostgresRepository) RevokeAllSessions(ctx context.Context, userID uuid.
 		return fmt.Errorf("user: revoke all sessions: %w", err)
 	}
 	return nil
+}
+
+// BumpTokenVersion increments the user's token version and returns it.
+func (r *PostgresRepository) BumpTokenVersion(ctx context.Context, id uuid.UUID) (int, error) {
+	var v int
+	err := r.db.QueryRowContext(ctx,
+		`UPDATE users SET token_version = token_version + 1 WHERE id = $1 RETURNING token_version`, id).Scan(&v)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("user: bump token version: %w", err)
+	}
+	return v, nil
+}
+
+// SessionState reports, in one query, whether the user exists, their token
+// version, and whether the given session (refresh-token family) still exists.
+// A nil session is always live. It satisfies auth.SessionLoader.
+func (r *PostgresRepository) SessionState(ctx context.Context, userID, session uuid.UUID) (auth.SessionState, error) {
+	var sess any
+	if session != uuid.Nil {
+		sess = session
+	}
+	st := auth.SessionState{UserExists: true}
+	err := r.db.QueryRowContext(ctx, `
+		SELECT u.token_version,
+		       $2::uuid IS NULL OR EXISTS (
+		           SELECT 1 FROM refresh_tokens rt WHERE rt.family_id = $2::uuid AND rt.user_id = u.id)
+		FROM users u WHERE u.id = $1`, userID, sess).Scan(&st.Version, &st.SessionLive)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return auth.SessionState{}, nil
+		}
+		return auth.SessionState{}, fmt.Errorf("user: session state: %w", err)
+	}
+	return st, nil
 }

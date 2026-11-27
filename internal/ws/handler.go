@@ -84,7 +84,8 @@ func (h *Handler) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := newClient(h.hub, conn, roomID, userID, username)
+	session, _ := auth.SessionIDFromContext(r.Context())
+	client := newClient(h.hub, conn, roomID, userID, session, username)
 	// run owns the connection and blocks until it ends; keep the handler alive
 	// for the life of the socket.
 	client.run(r.Context())

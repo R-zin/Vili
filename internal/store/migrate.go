@@ -15,11 +15,37 @@ import (
 //go:embed migrations/*.up.sql
 var migrationsFS embed.FS
 
+// migrateLockKey is the advisory-lock key serializing migrations across
+// instances ("vili" in ASCII).
+const migrateLockKey = 0x76696c69
+
 // Migrate applies all pending *.up.sql migrations in order and reports the
 // versions it applied. It is idempotent: already-applied versions are skipped
 // (tracked in schema_migrations), so running it on every startup is safe.
+//
+// Several instances may start at once (scale-out, rolling deploys): the whole
+// run holds a Postgres session advisory lock, so they migrate one at a time
+// and the later ones find nothing left to do.
 func Migrate(ctx context.Context, db *sql.DB) ([]string, error) {
-	if _, err := db.ExecContext(ctx, `
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: migration connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrateLockKey); err != nil {
+		return nil, fmt.Errorf("store: migration lock: %w", err)
+	}
+	defer func() {
+		// Unlock even if ctx was cancelled; closing the connection would also
+		// release it, but pooled connections are reused.
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrateLockKey)
+	}()
+	return migrate(ctx, conn)
+}
+
+// migrate runs the migrations on conn (which holds the migration lock).
+func migrate(ctx context.Context, conn *sql.Conn) ([]string, error) {
+	if _, err := conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    text PRIMARY KEY,
 			applied_at timestamptz NOT NULL DEFAULT now()
@@ -33,7 +59,7 @@ func Migrate(ctx context.Context, db *sql.DB) ([]string, error) {
 	}
 
 	applied := make(map[string]bool, len(names))
-	rows, err := db.QueryContext(ctx, `SELECT version FROM schema_migrations`)
+	rows, err := conn.QueryContext(ctx, `SELECT version FROM schema_migrations`)
 	if err != nil {
 		return nil, fmt.Errorf("store: read schema_migrations: %w", err)
 	}
@@ -57,7 +83,7 @@ func Migrate(ctx context.Context, db *sql.DB) ([]string, error) {
 		if applied[version] {
 			continue
 		}
-		if err := applyOne(ctx, db, name, version); err != nil {
+		if err := applyOne(ctx, conn, name, version); err != nil {
 			return nil, err
 		}
 		ran = append(ran, version)
@@ -86,13 +112,13 @@ func migrationNames() ([]string, error) {
 }
 
 // applyOne runs a single migration file in a transaction and records it.
-func applyOne(ctx context.Context, db *sql.DB, name, version string) error {
+func applyOne(ctx context.Context, conn *sql.Conn, name, version string) error {
 	body, err := migrationsFS.ReadFile("migrations/" + name)
 	if err != nil {
 		return fmt.Errorf("store: read migration %s: %w", name, err)
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin migration %s: %w", version, err)
 	}

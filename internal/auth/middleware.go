@@ -14,8 +14,11 @@ import (
 // preventing collisions with keys set by other packages.
 type contextKey int
 
-// userIDKey keys the authenticated user id stored in the request context.
-const userIDKey contextKey = iota
+// Keys for the authenticated identity stored in the request context.
+const (
+	userIDKey contextKey = iota
+	sessionIDKey
+)
 
 // Middleware returns HTTP middleware that requires a valid
 // "Authorization: Bearer <token>" header. It verifies the token, parses the
@@ -28,12 +31,26 @@ func (s *TokenService) Middleware(next http.Handler) http.Handler {
 			respond.Error(w, http.StatusUnauthorized, "unauthorized", "missing or malformed authorization header")
 			return
 		}
-		userID, err := s.Verify(tokenString)
+		id, err := s.VerifyIdentity(tokenString)
 		if err != nil {
 			respond.Error(w, http.StatusUnauthorized, "unauthorized", "invalid or expired token")
 			return
 		}
-		ctx := context.WithValue(r.Context(), userIDKey, userID)
+		if s.validator != nil {
+			ok, err := s.validator.Valid(r.Context(), id)
+			if err != nil {
+				// Fail closed: without the session store we cannot tell a
+				// revoked token from a live one.
+				respond.Errorf(w, http.StatusServiceUnavailable, "unavailable", "could not verify session", err)
+				return
+			}
+			if !ok {
+				respond.Error(w, http.StatusUnauthorized, "unauthorized", "session has ended; sign in again")
+				return
+			}
+		}
+		ctx := context.WithValue(r.Context(), userIDKey, id.UserID)
+		ctx = context.WithValue(ctx, sessionIDKey, id.Session)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -64,6 +81,13 @@ func (s *TokenService) RequireWS(next http.HandlerFunc) http.Handler {
 // The second return value reports whether a user id was present.
 func UserIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	id, ok := ctx.Value(userIDKey).(uuid.UUID)
+	return id, ok
+}
+
+// SessionIDFromContext returns the login session of the authenticated token
+// (uuid.Nil for tokens without one).
+func SessionIDFromContext(ctx context.Context) (uuid.UUID, bool) {
+	id, ok := ctx.Value(sessionIDKey).(uuid.UUID)
 	return id, ok
 }
 

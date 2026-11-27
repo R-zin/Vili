@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,5 +108,70 @@ func TestPurge(t *testing.T) {
 	// Idempotent.
 	if tk, iv, err := Purge(ctx, db); err != nil || tk != 0 || iv != 0 {
 		t.Fatalf("second purge should be a no-op: %d %d %v", tk, iv, err)
+	}
+}
+
+// TestMigrate_ConcurrentStartups runs migrations from several "instances" at
+// once against a brand-new database: all must succeed, and each migration must
+// be applied exactly once.
+func TestMigrate_ConcurrentStartups(t *testing.T) {
+	if os.Getenv("RUN_DB_TESTS") != "1" || os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("set RUN_DB_TESTS=1 and TEST_DATABASE_URL to run database integration tests")
+	}
+	base := os.Getenv("TEST_DATABASE_URL")
+	admin, err := Open(config.Config{DatabaseURL: base, DB: config.DB{MaxOpenConns: 2, MaxIdleConns: 2, ConnMaxLifetime: time.Minute}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	name := fmt.Sprintf("vili_migrate_race_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(`CREATE DATABASE ` + name); err != nil {
+		t.Skipf("cannot create a scratch database: %v", err)
+	}
+	t.Cleanup(func() { _, _ = admin.Exec(`DROP DATABASE IF EXISTS ` + name + ` WITH (FORCE)`) })
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+
+	const instances = 4
+	var wg sync.WaitGroup
+	errs := make(chan error, instances)
+	applied := make(chan int, instances)
+	for i := 0; i < instances; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			db, err := Open(config.Config{DatabaseURL: u.String(), DB: config.DB{MaxOpenConns: 3, MaxIdleConns: 3, ConnMaxLifetime: time.Minute}})
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer db.Close()
+			ran, err := Migrate(context.Background(), db)
+			if err != nil {
+				errs <- err
+				return
+			}
+			applied <- len(ran)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	close(applied)
+	for err := range errs {
+		t.Fatalf("concurrent migrate failed: %v", err)
+	}
+	total, winners := 0, 0
+	for n := range applied {
+		total += n
+		if n > 0 {
+			winners++
+		}
+	}
+	names, _ := migrationNames()
+	if winners != 1 || total != len(names) {
+		t.Fatalf("each migration must run exactly once: winners=%d applied=%d want %d", winners, total, len(names))
 	}
 }

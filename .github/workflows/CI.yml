@@ -85,8 +85,8 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Database integration tests (store, user, room, message)
-        run: go test -v -race -count=1 ./internal/store/... ./internal/user/... ./internal/room/... ./internal/message/...
+      - name: Database integration tests (store, user, room, message, bus, presence)
+        run: go test -v -race -count=1 ./internal/store/... ./internal/user/... ./internal/room/... ./internal/message/... ./internal/bus/... ./internal/ws/...
 
       - name: Build server and CLI
         run: |
@@ -229,13 +229,38 @@ jobs:
       - name: E2E — private rooms, invites, mentions, unread, edit/delete, search, moderation, DMs, account lifecycle
         run: ./scripts/e2e.sh http://localhost:8080 ./bin/vili
 
+      - name: Start a second server instance (same database)
+        env:
+          PORT: "8081"
+          INSTANCE_ID: ci-node-b
+          RATE_LIMIT_AUTH_RPS: "100"
+          RATE_LIMIT_AUTH_BURST: "100"
+        run: |
+          ./bin/vili-server > server-b.log 2>&1 &
+          echo $! > server-b.pid
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8081/ready > /dev/null && exit 0
+            sleep 1
+          done
+          echo "second instance did not become ready" >&2
+          cat server-b.log >&2
+          exit 1
+
+      - name: Cluster E2E — realtime, presence, kicks and token revocation across two instances
+        run: ./scripts/e2e-cluster.sh http://localhost:8080 http://localhost:8081 ./bin/vili
+
       - name: Server log
         if: always()
-        run: cat server.log
+        run: |
+          cat server.log
+          echo "--- second instance ---"
+          cat server-b.log 2>/dev/null || true
 
       - name: Stop server
         if: always()
-        run: kill "$(cat server.pid)" 2>/dev/null || true
+        run: |
+          kill "$(cat server.pid)" 2>/dev/null || true
+          kill "$(cat server-b.pid)" 2>/dev/null || true
 
   # Build verification: confirms Dockerfile builds cleanly on production distroless base.
   docker:

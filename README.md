@@ -33,7 +33,8 @@ See [Deployment](#deployment), [Install (Homebrew)](#install-homebrew), and [Sec
 
 ## Features
 
-- **Accounts & auth** — register/login, bcrypt password hashing, short-lived **JWT (HS256)** access tokens with a hardened verification path (no algorithm confusion, no panicking claim assertions, fail-fast on an empty secret).
+- **Accounts & auth** — register/login, bcrypt password hashing, short-lived **JWT (HS256)** access tokens with a hardened verification path (no algorithm confusion, no panicking claim assertions, fail-fast on an empty secret). Access tokens are bound to their login session and **revoked immediately** on logout, "sign out everywhere", password change or account deletion — on every instance.
+- **Horizontal scaling** — run any number of server instances against one Postgres: realtime messages, presence, typing, kicks and session revocations fan out across instances over Postgres `LISTEN/NOTIFY`; concurrent startups migrate safely.
 - **Rooms & membership** — public and **private (invite-only)** rooms, join/leave, `owner`/`admin`/`member` roles, member listing, kick, promote/demote, rename, delete. Private rooms are invisible to non-members (same `404` as an unknown room). When the last owner leaves, ownership passes on; an emptied room is deleted.
 - **Invites** — unguessable (96-bit) codes, stored only as SHA-256 digests; optional max-uses and expiry; revocable; redemption is atomic so concurrent users cannot exceed `max_uses`.
 - **Messages** — persisted in PostgreSQL, typed payloads (`text`, `diff`, `code`, `log`, `commit`), cursor-paginated history (`before` + `limit`), **replies**, **edit**, **delete** (tombstoned; content erased; room owners/admins can moderate), **@mentions** (resolved to real room members, capped per message).
@@ -61,7 +62,9 @@ internal/
   user/        accounts: types, Postgres repo, register/login handlers
   room/        rooms & membership: types, repo, handlers
   message/     messages: types, repo, membership-gated handler + post broadcast
-  ws/          realtime: in-memory hub (per-user conn cap), pumps, WS upgrade handler
+  ws/          realtime: per-process hub (per-user conn cap), pumps, WS upgrade handler,
+               cluster-wide presence (Postgres)
+  bus/         cluster bus: Postgres LISTEN/NOTIFY fan-out of events, kicks and revocations
   event/       realtime wire envelope (tiny leaf shared by message & ws)
   auth/        bcrypt + JWT (issue/verify) + auth middleware (HTTP + WS) + ctx accessor
   httputil/    cross-cutting middleware: recovery, security headers, body cap,
@@ -290,6 +293,38 @@ socket can't be opened it falls back to the original polling loop. Open the bund
 
 Kicking a member, a member leaving, or deleting a room **closes the affected live sockets immediately**.
 
+## Running multiple instances
+
+Every instance keeps its own WebSocket connections, and a **cluster bus** over
+Postgres `LISTEN/NOTIFY` carries everything that has to reach connections on
+other instances. No extra infrastructure is needed beyond the database.
+
+- **Realtime fan-out** — new/edited/deleted messages, presence join/leave and
+  typing are published once and delivered by every instance to its sockets.
+  Payloads over Postgres's 8 KB NOTIFY limit go through a short-lived
+  `bus_outbox` row and only the id is notified.
+- **Evictions** — kicking a member, leaving, or deleting a room closes the
+  affected sockets on whichever instance holds them.
+- **Presence** — `presence.state` lists who is online across the whole
+  cluster. Instances record their connections in `ws_presence` and heartbeat
+  in `ws_instances` every 10 s; a crashed instance's users drop out after 35 s
+  and its rows are purged by the janitor. A clean shutdown removes them at once.
+- **Safe startup** — migrations hold a Postgres advisory lock, so instances
+  started together (scale-out, rolling deploys) migrate one at a time.
+- **Health** — `/ready` returns 503 while an instance's bus listener is
+  disconnected, so load balancers route around it; the listener reconnects with
+  exponential backoff. `/metrics` exports `vili_bus_connected`,
+  `vili_bus_published` and `vili_bus_received`.
+
+Delivery is at-most-once: an instance that loses its database connection
+misses the notifications sent meanwhile (its clients can reload history).
+Nothing durable travels on the bus — messages, memberships and sessions always
+live in Postgres.
+
+`REALTIME_BUS=local` turns the bus off for single-process development.
+`scripts/e2e-cluster.sh` (run in CI) drives two real instances and checks
+cross-instance delivery, presence, kicks and token revocation.
+
 ## Configuration
 
 Configuration is environment-only (`os.LookupEnv`), read once at startup and injected —
@@ -320,7 +355,10 @@ server exits non-zero if either is missing/empty.
 | `RATE_LIMIT_AUTH_BURST` | — | `10` | Burst size per IP on `/v1/auth/*` |
 | `RATE_LIMIT_MESSAGES_RPS` | — | `10` | Sustained req/s per user on message POST |
 | `RATE_LIMIT_MESSAGES_BURST` | — | `20` | Burst size per user on message POST |
-| `WS_MAX_CONNS_PER_USER` | — | `5` | Max concurrent WebSocket connections per user |
+| `WS_MAX_CONNS_PER_USER` | — | `5` | Max concurrent WebSocket connections per user (per instance) |
+| `REALTIME_BUS` | — | `postgres` | `postgres` (LISTEN/NOTIFY; required for more than one instance) or `local` (single process) |
+| `INSTANCE_ID` | — | _(hostname-derived)_ | Name of this instance in the cluster (logs, presence) |
+| `SESSION_CACHE_TTL` | — | `30s` | How long a token's session check is cached. Revocations clear caches cluster-wide immediately; this only bounds staleness if an instance misses that signal. Max `5m`. |
 | `REQUEST_LOG_ENABLED` | — | `true` | Per-request access log (no tokens/bodies) |
 | `METRICS_ENABLED` | — | `true` | Serve Prometheus text at `/metrics` |
 | `PPROF_ENABLED` | — | `false` | Mount `net/http/pprof` at `/debug/pprof` (trusted envs only) |
@@ -335,6 +373,7 @@ server exits non-zero if either is missing/empty.
 - **Headers**: every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a restrictive `Content-Security-Policy`.
 - **Recovery**: a handler panic is caught and returned as the uniform `500` envelope (with the stack logged server-side), never a dropped connection.
 - **CORS**: deny-by-default. No `Access-Control-Allow-Origin` is emitted unless the request `Origin` is in `CORS_ALLOWED_ORIGINS`. The CLI sends no `Origin` header and the `index.html` demo is opened as a local file, so neither needs a browser CORS grant.
+- **Session revocation**: access tokens carry their login session (`sid`) and the user's token version (`ver`). Each request checks them against the database through a short-lived cache, so a token stops working **immediately** when its session is logged out or revoked, the refresh-token family is burned by reuse detection, the password changes, the user signs out everywhere, or the account is deleted — and that user's live WebSocket connections are closed on every instance. If the session store is unreachable, requests fail closed with `503`.
 - **Authorization**: room roles are enforced server-side (`owner` > `admin` > `member`); non-members and private rooms answer with the same `404` as unknown rooms. Invite codes and refresh tokens are stored only as digests. Password change/account deletion re-verify the current password and are rate-limited per IP; a password change revokes every other session.
 - **Rate limiting**: token-bucket limiters (per-IP on `/v1/auth/*`, per-user on message POST) return `429` + `Retry-After` when exceeded; WebSocket connections are capped per user. Buckets are evicted when idle so a spoofed-IP flood can't grow memory unboundedly; forwarded headers are honored **only** from peers in `TRUSTED_PROXIES`, so a client cannot spoof its way out of a limit.
 
@@ -420,7 +459,8 @@ Current green gate for CI: `go build ./...`, `go vet ./...`, `gofmt -l .` empty,
 - [x] **Phase 4** — real-time messaging (WebSocket), presence, typing indicators; live CLI chat view
 - [x] **Phase 5** — production hardening (security headers, body caps, panic recovery, deny-by-default CORS), observability (access logs, `/metrics`, gated pprof), rate limiting (per-IP/per-user token buckets + a WS connection cap), Docker/fly deployment, **Homebrew distribution**
 - [x] **Phase 6** — collaboration & account lifecycle: refresh-token rotation + server-side logout; private rooms + invite codes; room moderation (kick/promote/edit/delete); unread counts and read cursors; @mentions; replies, edit, delete; full-text search; direct messages; `/v1/me`, password change, session management, account deletion; trusted-proxy-aware rate limiting; WS metrics; expired-token janitor; end-to-end CLI test in CI.
-- [ ] **Next** — multi-instance realtime fan-out (Postgres `LISTEN/NOTIFY` or Redis; the hub is in-memory today, so run a single instance), incoming webhooks / bot tokens, per-username login throttling, full-screen TUI, email verification, message retention policy.
+- [x] **Phase 7** — horizontal scaling and immediate revocation: Postgres `LISTEN/NOTIFY` cluster bus (events, kicks, revocations), cluster-wide presence with heartbeats, advisory-locked migrations, session-bound access tokens with token versions and a cluster-invalidated session cache, two-instance end-to-end test in CI.
+- [ ] **Next** — incoming webhooks / bot tokens, GitHub integration, per-username login throttling, full-screen TUI, email verification, message retention policy.
 
 ## Built with
 
